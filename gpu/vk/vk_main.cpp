@@ -892,12 +892,13 @@ bool started_up() {
         static int part;
         static PrepareBar bar;
         const auto progress = [](size_t done, size_t total) {
-            static int last = -1;
+            static ProgressHeartbeat beat;
+            static const auto t0 = std::chrono::steady_clock::now();
             if (!total) return;
             bar.at(part, done, total);
             const int at = (int)(bar.fraction() * 1000);
-            if (at == last) return;
-            last = at;
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (!beat.due(at, done, secs)) return;   // (a slow driver: the same step for minutes still prints every 10 s, #2242)
             printf("@@progress %.3f\n", at / 1000.0);
             fflush(stdout);
         };

@@ -148,6 +148,20 @@ int main() {
         CHECK(std::fabs(w.fraction() - 0.5) < 1e-9);
         CHECK(percent_of(0.999) == "99%" && percent_of(1) == "100%" && percent_of(-1).empty());
     }
+    // a builder's headless run: a new step always goes out; a slow driver's step, minutes long, goes out every 10 s while the
+    // count still moves; a count that stopped sends nothing, so a real hang is still read as silence
+    {
+        ProgressHeartbeat h;
+        CHECK(h.due(100, 0, 0.0));          // (the first line)
+        CHECK(!h.due(100, 0, 5.0));         // (nothing new)
+        CHECK(!h.due(100, 7, 9.0));         // (the count moved: the period, not each call)
+        CHECK(h.due(100, 8, 10.0));
+        CHECK(!h.due(100, 8, 3600.0));      // (a count that stopped: silent, however long)
+        CHECK(h.due(101, 8, 3601.0));       // (a new step: at once)
+        CHECK(!h.due(101, 9, 3602.0));
+        CHECK(h.due(101, 9, 3611.0));
+        CHECK(ProgressHeartbeat::kIdleS < 15 * 60);   // (under the builder's PREPARE_SILENCE)
+    }
     std::printf("PASS: counts, time left and its wording\n");
 }
 '''
@@ -199,6 +213,12 @@ def main():
         text = (ROOT / host).read_text(encoding="utf-8")
         if text.count("rx_close_asked();") < 1:
             raise SystemExit(host + " ends the process on close without letting the preparation keep its work")
+    # a headless --prepare-shaders run prints at each bar step and every 10 s while the count moves, and its state list's own
+    # programs report too: the builder stops a run silent for 15 minutes (#2242)
+    if "ProgressHeartbeat" not in started or "beat.due(" not in started:
+        raise SystemExit("the headless preparation does not repeat @@progress on a slow driver's long step (#2242)")
+    if "state_list_prepare(progress)" not in prep or "state_list_prepare(nullptr)" in prep:
+        raise SystemExit("prepare_run leaves the state list's translation out of the builder's progress (#2242)")
 
     with tempfile.TemporaryDirectory(prefix="startup-progress-") as tmp:
         cpp = Path(tmp) / "fixture.cpp"

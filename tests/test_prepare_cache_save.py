@@ -21,6 +21,7 @@ already_prepared=block((a.source/'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8
 cpp=r"""
 #include "vk_progress.h"
 using namespace mkwvk;
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>

@@ -179,6 +179,26 @@ struct PrepareBar {
     }
 };
 
+/// (hookshot) When a progress line goes out to a builder that runs the preparation headless (--prepare-shaders): at every new step
+/// of the bar, and at least every kIdleS seconds while the work has advanced since the last line. A slow driver moves the bar's
+/// 0.1% steps minutes apart, and the builder stops a run that prints nothing for 15 minutes (#2242): the repeats keep it awake.
+/// A count that does not move sends nothing, however long it stays, so a real hang still reads as silence
+struct ProgressHeartbeat {
+    static constexpr double kIdleS = 10.0;
+    int at = -1;          // (the bar's step of the last line)
+    size_t done = 0;      // (the count it went out with)
+    double last = -1e9;   // (the seconds it went out at)
+    /// Whether a line is due: a new step, or a new count and kIdleS since the last line
+    bool due(int step, size_t done_now, double secs) {
+        if (step == at && done_now == done) return false;
+        if (step != at || secs - last >= kIdleS) {
+            at = step, done = done_now, last = secs;
+            return true;
+        }
+        return false;
+    }
+};
+
 /// The screen for a state. The first second shows the wordmark alone: a start with next to nothing to prepare is over by then
 inline StartupView startup_view(const StartupState& s) {
     StartupView v;

@@ -7675,7 +7675,9 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background, b
         if (next.load() >= total + threads.size()) break;
     }
     for (std::thread& t : threads) t.join();
-    if (!background) state_list_prepare(nullptr);   // (in play it is too late for the precompile: an update's is state_list_run, before)
+    // (in play it is too late for the precompile: an update's is state_list_run, before. The progress: its programs are
+    // translated here, minutes on a slow CPU, and a headless run that prints nothing looks hung to its builder, #2242)
+    if (!background) state_list_prepare(progress);
     if (!getenv("RX_VK_SEED_CHECK")) seed_close();
     if (prepare_stopped()) {   // (closed: what was made is in the program cache already, the rest is made at the next start)
         logf("vk: shader preparation stopped at %zu of %zu (the window was closed): the next start goes on from there", done.load(),
