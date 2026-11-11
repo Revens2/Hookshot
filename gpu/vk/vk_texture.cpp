@@ -50,6 +50,7 @@
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
 #include "vram_compact.h"
+#include "vram_pressure.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
@@ -3826,10 +3827,12 @@ void texture_frame(uint64_t completed) {
     // not grow, and what this evicts frees space inside the blocks that the count keeps. Ten frames later it squeezed again: a
     // ratchet. On a 4 GB RX 5500M (3337 MB used of 3337, 1224 MB free in the blocks) a paused game, whose scene draws nothing,
     // lost 1700 MB of textures in seconds, made again on unpausing (the long wait), and the HUD's drawn textures went with them.
-    // RX_VK_SQUEEZE_ALWAYS=1: as before
+    // But only while the count is within the allowance: past it the driver pages VRAM out to system memory, whatever room the
+    // blocks hold (#2156: an RTX 5050 8 GB at 7602 MB used of 6982 with 1649 MB free in the blocks paged 4.5 GB and dropped to
+    // 14-25 fps; v2.0.14, without this wait, squeezed there). RX_VK_SQUEEZE_ALWAYS=1: as before
     static const bool squeeze_always = getenv("RX_VK_SQUEEZE_ALWAYS") != nullptr;
-    const bool room_in_blocks = !squeeze_always && block_free >= allowed / 8;
-    if (known && !by_blocks && used > allowed / 100 * 97 && !room_in_blocks) {
+    const bool squeeze_held = vram_pressure::squeeze_waits(used, allowed, block_free, squeeze_always);
+    if (known && !by_blocks && used > allowed / 100 * 97 && !squeeze_held) {
         const uint64_t over = used - allowed / 100 * 97;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
@@ -3848,7 +3851,7 @@ void texture_frame(uint64_t completed) {
              "MB), %zu textures%s", (unsigned long long)(used >> 20), (unsigned long long)(allowed >> 20),
              (unsigned long long)(block_free >> 20), (unsigned long long)(total_bytes >> 20),
              (unsigned long long)(budget >> 20), textures.size(),
-             known && used > allowed / 100 * 97 && room_in_blocks ? " (at the driver's limit, room in the blocks: not squeezed)" : "");
+             known && used > allowed / 100 * 97 && squeeze_held ? " (at the driver's limit, room in the blocks: not squeezed)" : "");
         // (what takes it: decoded ASTC, the GPU's images, the rest; the largest)
         uint64_t astc_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0;
         size_t baked_n = 0;

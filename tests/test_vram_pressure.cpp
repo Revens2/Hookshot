@@ -9,6 +9,7 @@
 using mkwvk::vram_pressure::allocated;
 using mkwvk::vram_pressure::shadow_fits;
 using mkwvk::vram_pressure::shadows_go;
+using mkwvk::vram_pressure::squeeze_waits;
 
 int main() {
     const uint64_t MB = 1 << 20;
@@ -42,6 +43,15 @@ int main() {
     CHECK(!shadow_fits(shadows, 9400 * MB, allowed, 3000 * MB));             // (9,800 MB: 98%, where they came back before)
     CHECK(shadow_fits(shadows, 9300 * MB, allowed, 3000 * MB));              // (9,700 MB: 97%)
     CHECK(!shadows_go(9700 * MB, allowed, 3000 * MB));                       // (and there they stay)
+    // (the 97% squeeze waits only while the count is within the allowance: past it the driver pages VRAM out, whatever room
+    // the blocks hold. #2156: an RTX 5050 8 GB at 7,602 MB used of 6,982 with 1,649 MB free in the blocks paged 4.5 GB)
+    CHECK(squeeze_waits(3337 * MB, 3337 * MB, 1224 * MB, false));   // (a 4 GB RX 5500M at its limit: the eviction freed only block space)
+    CHECK(squeeze_waits(6900 * MB, 6982 * MB, 1000 * MB, false));   // (within the allowance, an eighth free: the squeeze waits)
+    CHECK(!squeeze_waits(7000 * MB, 6982 * MB, 1649 * MB, false));  // (past the allowance: the squeeze runs)
+    CHECK(!squeeze_waits(7602 * MB, 6982 * MB, 1649 * MB, false));  // (#2156: 108.9% of the allowance, 1,649 MB free in the blocks)
+    CHECK(!squeeze_waits(6900 * MB, 6982 * MB, 400 * MB, false));   // (the blocks hold under an eighth)
+    CHECK(!squeeze_waits(3337 * MB, 3337 * MB, 1224 * MB, true));   // (RX_VK_SQUEEZE_ALWAYS=1)
+    CHECK(!squeeze_waits(0, 0, 0, false));                          // (no budget known: as before)
     std::printf("PASS: the shadows go by what is really allocated\n");
     return 0;
 }

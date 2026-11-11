@@ -1,5 +1,5 @@
-/* How full VRAM really is, for the rules that give memory back near the driver's limit (vk_memory.cpp's write-back shadows).
-   No Vulkan here. tests/test_vram_pressure.py */
+/* How full VRAM really is, for the rules that give memory back near the driver's limit (vk_memory.cpp's write-back shadows,
+   vk_texture.cpp's 97% squeeze). No Vulkan here. tests/test_vram_pressure.py */
 #pragma once
 
 #include <algorithm>
@@ -35,6 +35,16 @@ inline bool shadows_go(uint64_t used, uint64_t allowed, uint64_t block_free) {
 inline bool shadow_fits(uint64_t n, uint64_t used, uint64_t allowed, uint64_t block_free) {
     if (!allowed) return true;
     return allocated(used, block_free) + n <= allowed / 100 * 90 && used + n <= allowed / 100 * 97;
+}
+
+/// Whether the 97% driver's-limit squeeze waits: while VMA's blocks hold an eighth of the allowance free, new images take
+/// that space without the driver's count growing, and what an eviction gives back is room inside the blocks that the count
+/// keeps (a ratchet that drained a paused 4 GB card's textures). Only while the count is within the allowance: past it the
+/// driver pages VRAM out to system memory, whatever room the blocks hold (an RTX 5050 8 GB at 7,602 MB used of 6,982
+/// allowed with 1,649 MB free in the blocks paged 4.5 GB, #2156). RX_VK_SQUEEZE_ALWAYS=1 squeezes as before.
+inline bool squeeze_waits(uint64_t used, uint64_t allowed, uint64_t block_free, bool squeeze_always) {
+    if (!allowed) return false;
+    return !squeeze_always && used <= allowed && block_free >= allowed / 8;
 }
 
 } // namespace mkwvk::vram_pressure
