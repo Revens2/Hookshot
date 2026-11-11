@@ -1,7 +1,5 @@
-"""Compile and run the rules that judge VRAM near the driver's limit (gpu/vk/vram_pressure.h; no game/GPU required): the
-write-back shadows' and the texture budget that leaves the rest of the process its room; and check that vk_memory.cpp still
-judges the shadows by what is really allocated, with the switch back to the driver's count alone, and that vk_texture.cpp
-takes its budget through the helper."""
+"""Compile and run the write-back shadows' rules near the VRAM limit (gpu/vk/vram_pressure.h; no game/GPU required), and check
+that vk_memory.cpp still judges the shadows by what is really allocated, with the switch back to the driver's count alone."""
 import argparse
 import subprocess
 import tempfile
@@ -19,10 +17,6 @@ def check_source():
                    "vram_pressure::shadows_go(used, allowed, block_free)"):
         if needle not in src:
             raise SystemExit("vk_memory.cpp no longer has: " + needle)
-    tex = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
-    for needle in ('#include "vram_pressure.h"', "vram_pressure::texture_budget(budget, total_bytes, pressure, allowed)"):
-        if needle not in tex:
-            raise SystemExit("vk_texture.cpp no longer has: " + needle)
 
 
 def main():

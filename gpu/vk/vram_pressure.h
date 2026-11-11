@@ -1,6 +1,5 @@
-/* How full VRAM really is, for the rules that give memory back near the driver's limit (vk_memory.cpp's write-back shadows, and
-   the texture budget that leaves the rest of the process its room: vk_texture.cpp's texture_frame). No Vulkan here.
-   tests/test_vram_pressure.py */
+/* How full VRAM really is, for the rules that give memory back near the driver's limit (vk_memory.cpp's write-back shadows).
+   No Vulkan here. tests/test_vram_pressure.py */
 #pragma once
 
 #include <algorithm>
@@ -36,20 +35,6 @@ inline bool shadows_go(uint64_t used, uint64_t allowed, uint64_t block_free) {
 inline bool shadow_fits(uint64_t n, uint64_t used, uint64_t allowed, uint64_t block_free) {
     if (!allowed) return true;
     return allocated(used, block_free) + n <= allowed / 100 * 90 && used + n <= allowed / 100 * 97;
-}
-
-/// The textures' budget that leaves the rest of the process's VRAM (the imports, the pools' mirrors, the render targets, the
-/// buffers, the pipelines) its room: `resident` is what the process really allocated (allocated(), or with compaction what
-/// the textures' pool's free space adds back), so everything but the textures is `resident - total`. The textures' own may
-/// then be what is left under 90% of what the driver allows; a budget taken once, at the first look, knows nothing of a
-/// rest that grows later (#2156: 8 GB card, a frozen 3.2 GB of textures beside 3.0 GB of other, the driver paged VRAM and
-/// a frame took 793 ms). Cards with room keep theirs: 90% of a 12-16 GB card's allowance less 3.5 GB is above the 6 GB the
-/// budget is capped at anyway
-inline uint64_t texture_budget(uint64_t budget, uint64_t total, uint64_t resident, uint64_t allowed) {
-    if (!allowed) return budget;
-    const uint64_t other = resident > total ? resident - total : 0;
-    const uint64_t room = allowed / 100 * 90;
-    return std::min(budget, room > other ? room - other : 0);
 }
 
 } // namespace mkwvk::vram_pressure

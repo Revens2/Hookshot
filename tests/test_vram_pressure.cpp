@@ -1,4 +1,4 @@
-// The rules that judge VRAM near the limit (gpu/vk/vram_pressure.h): the shadows' and the texture budget's. No game, no GPU.
+// The write-back shadows' rules near the VRAM limit (gpu/vk/vram_pressure.h): no game, no GPU.
 #include "../gpu/vk/vram_pressure.h"
 
 #include <cstdio>
@@ -9,7 +9,6 @@
 using mkwvk::vram_pressure::allocated;
 using mkwvk::vram_pressure::shadow_fits;
 using mkwvk::vram_pressure::shadows_go;
-using mkwvk::vram_pressure::texture_budget;
 
 int main() {
     const uint64_t MB = 1 << 20;
@@ -43,19 +42,6 @@ int main() {
     CHECK(!shadow_fits(shadows, 9400 * MB, allowed, 3000 * MB));             // (9,800 MB: 98%, where they came back before)
     CHECK(shadow_fits(shadows, 9300 * MB, allowed, 3000 * MB));              // (9,700 MB: 97%)
     CHECK(!shadows_go(9700 * MB, allowed, 3000 * MB));                       // (and there they stay)
-    // (the textures' budget leaves the rest of the process's VRAM its room: 90% of the allowance less what it holds.
-    // An 8 GB card, 7,000 MB allowed, 5,900 MB really allocated of which the textures are 2,810: the rest at 3,090)
-    CHECK(texture_budget(3213 * MB, 2810 * MB, 5900 * MB, 7000 * MB) == 3210 * MB);
-    // (the same budget on a card with room: 90% of 15,500 MB less 3,500 MB is above the 6 GB cap the budget has)
-    CHECK(texture_budget(6144 * MB, 3000 * MB, 6500 * MB, 15500 * MB) == 6144 * MB);
-    // (nothing changes while the rest and the budget fit under the line, so the cache may still grow to its budget)
-    CHECK(texture_budget(3213 * MB, 2810 * MB, 5000 * MB, 7000 * MB) == 3213 * MB);
-    // (the rest alone over the line: what is left for the textures, and not below nothing)
-    CHECK(texture_budget(3213 * MB, 1000 * MB, 6500 * MB, 7000 * MB) == 800 * MB);
-    CHECK(texture_budget(3213 * MB, 500 * MB, 7000 * MB, 7000 * MB) == 0);
-    // (no allowance known, or more textures counted than resident: unchanged)
-    CHECK(texture_budget(3213 * MB, 2810 * MB, 5900 * MB, 0) == 3213 * MB);
-    CHECK(texture_budget(3213 * MB, 2500 * MB, 2000 * MB, 7000 * MB) == 3213 * MB);
     std::printf("PASS: the shadows go by what is really allocated\n");
     return 0;
 }

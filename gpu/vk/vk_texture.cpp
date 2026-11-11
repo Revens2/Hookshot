@@ -50,7 +50,6 @@
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
 #include "vram_compact.h"
-#include "vram_pressure.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
@@ -3805,10 +3804,10 @@ void texture_frame(uint64_t completed) {
     const uint64_t pressure = by_blocks ? used : used - std::min(used, reclaim);
     pool_pressed = known && pressure > allowed / 10 * 9;   // (the target pool given back meanwhile)
     compact.pressed = known && vram_compact::pressed(used, allowed);   // (hookshot, RX_VK_COMPACT: by the driver's own count)
-    // (hookshot) and the budget leaves the rest of the process's VRAM (imports, mirrors, render targets, buffers, pipelines)
-    // its room every pass: 90% of the allowance less what it holds. Not only once, at the first look, when that rest was not
-    // loaded yet: a frozen 45% of the allowance beside it went past an 8 GB card's (#2156, the driver paged VRAM)
-    if (known) budget = vram_pressure::texture_budget(budget, total_bytes, pressure, allowed);
+    if (known && pressure > allowed / 10 * 9) {
+        const uint64_t over = pressure - allowed / 10 * 9;
+        budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
+    }
     // (hookshot, RX_VK_COMPACT) and the count is held at RX_VK_COMPACT_PCT% of the allowance (85; 50 to 90), as it will be once a
     // run has given the textures' free space back: within ~0.8 GB of what the driver allows the GPU's frame went from ~10 ms
     // to 13-20 ms with the shadows in place, the driver itself short. At 85 a five-minute walk across Hyrule Field at DLAA
