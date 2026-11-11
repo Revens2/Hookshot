@@ -1519,7 +1519,8 @@ void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrim
 }
 /// Every pipeline of the state lists (the player's own and the shipped one): its program translated
 /// when the program cache lacks it, then noted in hookshot_pipelines.bin for precompile_run to build. RX_VK_NO_STATE_LIST=1: off
-void state_list_prepare(void (*progress)(size_t done, size_t total), bool open_seed = false) {
+/// tick: a liveness report, in the state list's own records (not the bar's programs): a headless builder's heartbeat (#2242)
+void state_list_prepare(void (*tick)(size_t done, size_t total), bool open_seed = false) {
     if (getenv("RX_VK_NO_STATE_LIST")) return;
     const auto t0 = std::chrono::steady_clock::now();
     int shipped_version = 0;
@@ -1551,14 +1552,14 @@ void state_list_prepare(void (*progress)(size_t done, size_t total), bool open_s
     }
     // The texture variants that need translation are only known after loading the base programs.
     size_t done = 0, total = want.size() + recs.size();
-    std::mutex progress_mu;
-    const auto report_done = [&] {
-        if (progress) {
-            std::lock_guard<std::mutex> lock(progress_mu);
-            progress(++done, total);
+    std::mutex tick_mu;
+    const auto report_tick = [&] {
+        if (tick) {
+            std::lock_guard<std::mutex> lock(tick_mu);
+            tick(++done, total);
         }
     };
-    if (progress) progress(0, total);
+    if (tick) tick(0, total);
     std::atomic<size_t> next{0}, made{0}, missing{0};
     const auto worker = [&] {
         ub_thread_off();   // (a background thread: see ub_thread_off; the pipeline state list's builds raced the replay's updates)
@@ -1577,7 +1578,7 @@ void state_list_prepare(void (*progress)(size_t done, size_t total), bool open_s
                 for (Stage& st : p->stages)
                     if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
             }
-            report_done();
+            report_tick();
         }
     };
     std::vector<std::thread> threads;
@@ -1602,7 +1603,7 @@ void state_list_prepare(void (*progress)(size_t done, size_t total), bool open_s
         }
     }
     total = want.size() + variant_of.size();
-    if (progress) progress(done, total);
+    if (tick) tick(done, total);
     std::atomic<size_t> variants_made{0};
     next = 0;
     const auto variant_worker = [&] {
@@ -1620,7 +1621,7 @@ void state_list_prepare(void (*progress)(size_t done, size_t total), bool open_s
                 if (portable_variant(*p) == r.variant) variants_made++;
                 ensure_layout(const_cast<Program&>(*p));
             }
-            report_done();
+            report_tick();
         }
     };
     threads.clear();
@@ -7524,7 +7525,7 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
 /// background: in play, behind the game: a few workers at idle priority, translation only (the driver's part is left to first use:
 /// its compiler crashing in here would take the game with it)
 /// refresh_states: Builder preparation also imports state lists when the seed is already prepared
-bool prepare_run(void (*progress)(size_t done, size_t total), bool background, bool refresh_states) {
+bool prepare_run(void (*progress)(size_t done, size_t total), bool background, bool refresh_states, void (*tick)(size_t, size_t)) {
     const auto t0 = std::chrono::steady_clock::now();
     const std::string path = prepared_path();
     PreparedFor prepared_for;
@@ -7539,9 +7540,9 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background, b
     if (why == PrepareWhy::None && !getenv("RX_VK_PREPARE_AGAIN")) {
         // A Builder run can add pipeline states without changing the shader seed.
         if (getenv("RX_VK_SEED_CHECK")) {
-            if (seed_open() && refresh_states) state_list_prepare(progress);
+            if (seed_open() && refresh_states) state_list_prepare(tick);
         } else if (refresh_states) {
-            state_list_prepare(progress, true);
+            state_list_prepare(tick, true);
         }
         if (prepared_for.warmed == warmed || background) return false;
         // (translated, and the driver's part is another driver's, or of before the libraries were wanted: that part alone, no
@@ -7675,9 +7676,10 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background, b
         if (next.load() >= total + threads.size()) break;
     }
     for (std::thread& t : threads) t.join();
-    // (in play it is too late for the precompile: an update's is state_list_run, before. The progress: its programs are
-    // translated here, minutes on a slow CPU, and a headless run that prints nothing looks hung to its builder, #2242)
-    if (!background) state_list_prepare(progress);
+    // (in play it is too late for the precompile: an update's is state_list_run, before. The tick: its programs are
+    // translated here, minutes on a slow CPU, and a headless run that prints nothing looks hung to its builder, #2242. They
+    // are the state list's own counts, not the bar's programs: the bar and the screen's count stay where the programs left them)
+    if (!background) state_list_prepare(tick);
     if (!getenv("RX_VK_SEED_CHECK")) seed_close();
     if (prepare_stopped()) {   // (closed: what was made is in the program cache already, the rest is made at the next start)
         logf("vk: shader preparation stopped at %zu of %zu (the window was closed): the next start goes on from there", done.load(),

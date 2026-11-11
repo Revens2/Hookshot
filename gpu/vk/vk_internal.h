@@ -296,7 +296,10 @@ bool create_swapchain(uint32_t width, uint32_t height);
 bool replay_start();                          // vk_replay.cpp
 bool precompile_wanted();                     // vk_draw.cpp
 void precompile_run(void (*progress)(size_t done, size_t total));
-bool prepare_run(void (*progress)(size_t done, size_t total), bool background, bool refresh_states = false);
+/// tick: a liveness report for the steps of the preparation that are not the bar's count (the state lists' own programs), so a
+/// headless builder's heartbeat keeps printing while they run (#2242); they never move the bar or the start-up screen's count
+bool prepare_run(void (*progress)(size_t done, size_t total), bool background, bool refresh_states = false,
+                 void (*tick)(size_t done, size_t total) = nullptr);
 bool prepare_is_update();
 void prepare_background();
 void state_list_run();                        // (an update: the state list's pipelines noted before precompile_run)

@@ -29,12 +29,12 @@ using namespace mkwvk;
 using std::size_t;
 std::vector<int> calls;
 bool empty_states=false;
-void state_list_prepare(void(*progress)(size_t,size_t),bool open_seed=false){
- if(!open_seed||!progress)std::exit(7);
+void state_list_prepare(void(*tick)(size_t,size_t),bool open_seed=false){
+ if(!open_seed||!tick)std::exit(7);
  calls.push_back(6);
  if(!empty_states){
-  progress(1,4);
-  progress(4,4);
+  tick(1,4);
+  tick(4,4);
  }
 }
 int seed_open(){std::exit(8);}
@@ -43,7 +43,7 @@ bool warm_libraries(void(*)(size_t,size_t)){std::exit(10);}
 struct PreparedFor {int warmed=1;};
 void prepared_write(const std::string&, PreparedFor){std::exit(11);}
 bool fresh_seed=true;
-bool reuse_seed(void(*progress)(size_t,size_t),bool background,bool refresh_states){
+bool reuse_seed(void(*progress)(size_t,size_t),bool background,bool refresh_states,void(*tick)(size_t,size_t)){
  const PreparedFor already{};
  PreparedFor prepared_for=already;
  const int warmed=already.warmed;
@@ -51,10 +51,11 @@ bool reuse_seed(void(*progress)(size_t,size_t),bool background,bool refresh_stat
  const std::string warming="warming",path="prepared";
  """+already_prepared+r"""
 }
-bool prepare_run(void(*progress)(size_t,size_t),bool background=false,bool refresh_states=false){
+bool prepare_run(void(*progress)(size_t,size_t),bool background=false,bool refresh_states=false,
+                 void(*tick)(size_t,size_t)=nullptr){
  if(background||!refresh_states)std::exit(3);
  calls.push_back(1);
- return fresh_seed || reuse_seed(progress,background,refresh_states);
+ return fresh_seed || reuse_seed(progress,background,refresh_states,tick);
 }
 void predict_run(void(*)(size_t,size_t)){calls.push_back(5);}
 void precompile_run(void(*progress)(size_t,size_t)){calls.push_back(2);progress(1,2);}
@@ -73,14 +74,14 @@ int main(int argc,char** argv){
  empty_states=mode=="empty";
  if(!run()||calls!=std::vector<int>{1,fresh_seed?5:6,2,3,4})return 2;
  calls.clear();
- if(reuse_seed(nullptr,false,false)||!calls.empty())return 3;
+ if(reuse_seed(nullptr,false,false,nullptr)||!calls.empty())return 3;
 }
 """
 with tempfile.TemporaryDirectory(prefix='prepare-cache-') as tmp:
     src=Path(tmp)/'fixture.cpp';exe=Path(tmp)/'fixture.exe';src.write_text(cpp)
     subprocess.run([a.cxx,'-std=c++20','-I',str(a.source/'gpu'/'vk'),str(src),'-o',str(exe)],check=True)
     env={k:v for k,v in os.environ.items() if k not in ('RX_VK_SEED_CHECK','RX_VK_PREPARE_AGAIN')}
-    for mode, expected in [('fresh', ['0.714']), ('refresh', ['0.125','0.500','0.750']), ('empty', ['0.500'])]:
+    for mode, expected in [('fresh', ['0.714']), ('refresh', ['0.000','0.500']), ('empty', ['0.500'])]:
         result=subprocess.run([str(exe),mode],check=True,capture_output=True,text=True,env=env)
         progress=[line.split()[1] for line in result.stdout.splitlines() if line.startswith('@@progress ')]
         assert progress == expected, (mode, progress)

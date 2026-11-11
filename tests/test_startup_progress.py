@@ -214,11 +214,18 @@ def main():
         if text.count("rx_close_asked();") < 1:
             raise SystemExit(host + " ends the process on close without letting the preparation keep its work")
     # a headless --prepare-shaders run prints at each bar step and every 10 s while the count moves, and its state list's own
-    # programs report too: the builder stops a run silent for 15 minutes (#2242)
+    # programs report too, as a liveness tick that never moves the bar or the screen's count: the builder stops a run silent for
+    # 15 minutes (#2242), and the state list's records are not the bar's programs (they restarted the screen's count at 0/N)
     if "ProgressHeartbeat" not in started or "beat.due(" not in started:
         raise SystemExit("the headless preparation does not repeat @@progress on a slow driver's long step (#2242)")
-    if "state_list_prepare(progress)" not in prep or "state_list_prepare(nullptr)" in prep:
-        raise SystemExit("prepare_run leaves the state list's translation out of the builder's progress (#2242)")
+    tick_at = started.index("const auto tick = [](size_t done, size_t)")
+    tick = started[tick_at:started.index("};", tick_at)]
+    if "bar.at(" in tick or "@@progress" not in tick:
+        raise SystemExit("the state list's liveness tick moves the bar or the start-up screen's count (#2242)")
+    if "prepare_run(progress, false, true, tick)" not in started:
+        raise SystemExit("the headless preparation does not pass the state list its own liveness tick (#2242)")
+    if "state_list_prepare(progress)" in prep or "state_list_prepare(tick" not in prep:
+        raise SystemExit("prepare_run feeds the state list's records to the bar's count (#2242)")
 
     with tempfile.TemporaryDirectory(prefix="startup-progress-") as tmp:
         cpp = Path(tmp) / "fixture.cpp"

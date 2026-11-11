@@ -891,14 +891,23 @@ bool started_up() {
         // from the start: PrepareBar. The fixed shares it had (70%, 20%, 10%) kept the predicted pipelines' minutes in a fifth)
         static int part;
         static PrepareBar bar;
+        static ProgressHeartbeat beat;
+        static const auto t0 = std::chrono::steady_clock::now();
         const auto progress = [](size_t done, size_t total) {
-            static ProgressHeartbeat beat;
-            static const auto t0 = std::chrono::steady_clock::now();
             if (!total) return;
             bar.at(part, done, total);
             const int at = (int)(bar.fraction() * 1000);
             const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (!beat.due(at, done, secs)) return;   // (a slow driver: the same step for minutes still prints every 10 s, #2242)
+            printf("@@progress %.3f\n", at / 1000.0);
+            fflush(stdout);
+        };
+        // (the state list's own programs, inside prepare_run: its counts are records, not the bar's programs, so they only wake
+        // the builder: feeding them to the bar restarted the screen's count at 0/N while the bar held, #2242)
+        const auto tick = [](size_t done, size_t) {
+            const int at = (int)(bar.fraction() * 1000);
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (!beat.due(at, done, secs)) return;
             printf("@@progress %.3f\n", at / 1000.0);
             fflush(stdout);
         };
@@ -910,7 +919,7 @@ bool started_up() {
             for (int k = 0; k < 3; k++) bar.guess(k, guess[k]);
         }
         part = 0;
-        const bool prepared = prepare_run(progress, false, true);
+        const bool prepared = prepare_run(progress, false, true, tick);
         if (!prepared) {
             if (!bar.counted[0]) bar.skip(0);   // (an already prepared seed can still import pipeline states)
             bar.skip(1);
