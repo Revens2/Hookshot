@@ -96,7 +96,9 @@ C_COMMENT_OR_STRING = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\
 UI_RECORD_CALL = re.compile(r"\bui\s*::\s*record(?:_to)?\s*\(")
 NGX_RECORD_CALL = re.compile(r"\bNGX_(?:VULKAN_\w+_EXT|VK_\w+_DLSSG)\s*\(")   # (NVIDIA NGX's create/evaluate, DLSS's and frame generation's: its own commands into cmd)
 FFX_RECORD_CALL = re.compile(r"\bl\s*\.\s*dispatch\s*\(")   # (AMD FidelityFX's ffxDispatch, through its loaded pointer: its own commands into cmd)
-OPAQUE_RECORD_CALL = re.compile(UI_RECORD_CALL.pattern + "|" + NGX_RECORD_CALL.pattern + "|" + FFX_RECORD_CALL.pattern)
+ANR_RECORD_CALL = re.compile(r"\bg\s*\.\s*(?:create|evaluate)\s*\(")   # (Apex Neural Rendering FG's NGX exports, through their loaded pointers, vk_anrfg.cpp: its own commands into cmd)
+OPAQUE_RECORD_CALL = re.compile(UI_RECORD_CALL.pattern + "|" + NGX_RECORD_CALL.pattern + "|" + FFX_RECORD_CALL.pattern + "|" +
+                                ANR_RECORD_CALL.pattern)
 B_DIRECT_BEFORE = re.compile(r"::\s*mkwvk\s*::\s*rec\s*::\s*boundary\s*\(\s*::\s*mkwvk\s*::\s*rec\s*::\s*B_DIRECT\s*\)\s*;\Z")
 
 

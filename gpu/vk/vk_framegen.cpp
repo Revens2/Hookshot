@@ -21,6 +21,7 @@
 
 #include "vk_framegen.h"
 #include "vk_antilag.h"   // (AMD Anti-Lag 2: which game frame a set shows, antilag_frame / antilag_present_frame)
+#include "vk_anrfg.h"   // (Apex Neural Rendering FG, a DLSS-G provider: anr_fg_frames)
 #include "vk_dlss.h"   // (NVIDIA DLSS Frame Generation through NGX: dlss_fg_frames)
 #include "vk_reflex.h"   // (NVIDIA Reflex: which game frame a set shows, reflex_frame / reflex_present_frame)
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
@@ -518,7 +519,7 @@ void display_main() {
 // (hookshot) The last sets' makers (framegen_maker): each framegen_record notes its set's on the replay thread; the menu's
 // thread reads the counts. A ring of kMakerSets, the counts of each maker in it
 constexpr int kMakerSets = 64;
-std::atomic<int> maker_count[4] = {kMakerSets, 0, 0, 0};
+std::atomic<int> maker_count[5] = {kMakerSets, 0, 0, 0, 0};
 uint8_t maker_ring[kMakerSets] = {};
 int maker_pos = 0;
 std::atomic<int64_t> maker_at{0};
@@ -540,7 +541,9 @@ FgMaker framegen_maker() {
     const int b = maker_count[(int)FgMaker::BuiltIn].load(std::memory_order_relaxed);
     const int d = maker_count[(int)FgMaker::Dlss].load(std::memory_order_relaxed);
     const int f = maker_count[(int)FgMaker::Fsr3].load(std::memory_order_relaxed);
-    if (!b && !d && !f) return FgMaker::None;
+    const int a = maker_count[(int)FgMaker::Anr].load(std::memory_order_relaxed);
+    if (!b && !d && !f && !a) return FgMaker::None;
+    if (a >= b && a >= d && a >= f) return FgMaker::Anr;
     return d >= b && d >= f ? FgMaker::Dlss : f >= b ? FgMaker::Fsr3 : FgMaker::BuiltIn;
 }
 
@@ -879,13 +882,19 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     // (hookshot) NVIDIA DLSS Frame Generation through NGX where it runs and the Frame generation by row asks for it (vk_dlss.cpp):
     // every made frame of the set, from the scene's own depth, motion and camera. A set it does not make goes on below as before
     // (asked every present: turned off, it lets its feature go)
+    bool by_anr = false;
     if (m > 1) {
         VkImage outs[kMaxMult];
         VkImageView views[kMaxMult];
         for (int k = 0; k < m - 1; k++) outs[k] = set->frame[k].image, views[k] = set->frame[k].view;
-        set->made = dlss_fg_frames(cmd, fg.frames[cur].image, fg.frames[cur].view, uw, uh, m - 1, outs, views, blend, sequence);
+        // (hookshot) Apex Neural Rendering FG first, where the player put its DLL (vk_anrfg.cpp): a set it makes is not asked
+        // of DLSS-G, which is still called so that it lets its feature go when the row turns it off
+        set->made = anr_fg_frames(cmd, fg.frames[cur].image, fg.frames[cur].view, uw, uh, m - 1, outs, views, blend, sequence);
+        by_anr = set->made != 0;
+        if (!by_anr)
+            set->made = dlss_fg_frames(cmd, fg.frames[cur].image, fg.frames[cur].view, uw, uh, m - 1, outs, views, blend, sequence);
     }
-    FgMaker maker = set->made ? FgMaker::Dlss : FgMaker::None;
+    FgMaker maker = by_anr ? FgMaker::Anr : set->made ? FgMaker::Dlss : FgMaker::None;
     // (hookshot) At 2x, AMD FSR 3.1's frame interpolation where it runs; it makes the midpoint only, so 3x and more (and Auto,
     // above) stay with the interpolation below, as does any present it does not take
     if (set->made == 0 && blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);

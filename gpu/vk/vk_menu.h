@@ -10,7 +10,8 @@ namespace mkwvk {
 struct Options {
     int framegen = 0;     // made frames: 0 off, 1 Auto (to the display's refresh), or 2 to 8 times the game's frames
     int framegen_by = 0;  // (hookshot) who makes them at 2x and up: 0 Auto (NVIDIA DLSS Frame Generation where it runs, else the
-                          // renderer's own), 1 the renderer's own (vk_framegen.cpp; vk_dlss.cpp dlss_fg_wanted)
+                          // renderer's own), 1 the renderer's own (vk_framegen.cpp; vk_dlss.cpp dlss_fg_wanted), 2 Apex Neural
+                          // Rendering FG, the player's DLL (vk_anrfg.cpp), else the renderer's own
     int pace = 0;         // frames shown on an even line (vk_framegen.cpp)
     int vsync = 0;        // (hookshot) V-Sync, the swapchain's present mode (vk_main.cpp create_swapchain, made again at once): 0 Auto
                           // (mailbox where the driver has it), 1 On (FIFO), 2 Off (immediate). RX_VK_FIFO / RX_VK_IMMEDIATE over it

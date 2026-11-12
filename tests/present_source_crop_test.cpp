@@ -38,11 +38,15 @@ uint32_t allocated_w = 0, allocated_h = 0;
 namespace fsr3fi { bool wanted = false; bool frames_wanted() { return wanted; } }
 // (NVIDIA DLSS Frame Generation through NGX, vk_dlss.cpp: not asked for here, so the sets are the renderer's own)
 bool dlss_fg_wanted() { return false; }
+int dlss_calls = 0, anr_result = 0;
 int dlss_fg_frames(VkCommandBuffer, VkImage, VkImageView, uint32_t, uint32_t, int, const VkImage*, const VkImageView*, bool,
-                   uint64_t) { return 0; }   // (asked every present at 2x and up: makes none here)
+                   uint64_t) { ++dlss_calls; return 0; }   // (asked every present at 2x and up: makes none here)
+// (Apex Neural Rendering FG, vk_anrfg.cpp: asked before DLSS-G; anr_result made frames, none unless a check sets it)
+int anr_fg_frames(VkCommandBuffer, VkImage, VkImageView, uint32_t, uint32_t, int count, const VkImage*, const VkImageView*,
+                  bool blend, uint64_t) { return blend ? std::min(anr_result, count) : 0; }
 uint64_t reflex_frame() { return 0; }   // (vk_reflex.cpp: NVIDIA Reflex not on here)
 // (who made each set's frames, for the Insert menu's Frame generation by row: the last one noted)
-enum class FgMaker { None, BuiltIn, Dlss, Fsr3 };
+enum class FgMaker { None, BuiltIn, Dlss, Fsr3, Anr };
 FgMaker last_maker = FgMaker::Dlss;
 void note_maker(FgMaker m) { last_maker = m; }
 uint64_t antilag_frame() { return 0; }   // (vk_antilag.cpp: AMD Anti-Lag 2 not on here)
@@ -90,6 +94,7 @@ void reset() {
     blits = clears = initializations = sizes = dispatches = copies = 0;
     allocated_w = allocated_h = 0;
     fsr3fi::wanted = false; fsr_calls = 0; fsr_result = 1;
+    dlss_calls = 0; anr_result = 0;
     std::memset(copy_pc, 0, sizeof copy_pc);
 }
 void check(uint32_t sw, uint32_t sh, const int* crop, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
@@ -121,6 +126,13 @@ void check(uint32_t sw, uint32_t sh, const int* crop, uint32_t x, uint32_t y, ui
         CHECK(last_maker == FgMaker::BuiltIn);   // (FSR 3.1 made none: the renderer's own did)
         CHECK(dispatches == 9 && copies == 3);
         CHECK(copy_pc[0] == int(x) && copy_pc[1] == int(y) && copy_pc[2] == int(w) && copy_pc[3] == int(h));
+        // A set Apex Neural Rendering FG makes is its own: not asked of DLSS-G or FSR 3.1, and none of the renderer's passes.
+        const int asked = dlss_calls, fsr_before = fsr_calls;
+        for (auto& s : fg.sets) s.busy = false;   // (no display thread here to show the three sets recorded above)
+        anr_result = 1;
+        CHECK(framegen_record(nullptr, 1, sw, sh, crop) && fg.recorded->made == 1 && last_maker == FgMaker::Anr);
+        CHECK(dlss_calls == asked && fsr_calls == fsr_before && dispatches == 11 && copies == 4);
+        anr_result = 0;
     } else {
         CHECK(dispatches == 0 && copies == 0 && !fg.recorded);
         fsr3fi::wanted = true; fg.have_prev = true;

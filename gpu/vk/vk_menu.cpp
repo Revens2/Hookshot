@@ -37,6 +37,7 @@
 #include "vk_progress.h"   // (StartupView, version_text: the start-up screen)
 #include "vk_ui.h"
 #include "vk_menu_keys.h"   // (which gamepad buttons confirm and go back: those A and B are bound to)         // (how it looks: Dear ImGui, vk_imgui.h)
+#include "vk_anrfg.h"   // (Frame generation by: ANR FG, and why it does not make the frames, anr_fg_skip)
 #include "vk_dlss.h"
 #include "vk_framegen.h"   // (Frame generation by: who makes the frames now, framegen_maker)
 #include "vk_bug_report.h"   // (the Gameplay tab's Bug report: what it writes, and how)
@@ -993,6 +994,7 @@ MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stu
 const char* framegen_maker_name() {
     if (opts.framegen < 1) return nullptr;
     switch (framegen_maker()) {
+    case FgMaker::Anr: return "ANR FG";
     case FgMaker::Dlss: return "DLSS FG";
     case FgMaker::Fsr3: return "FSR 3.1 FG";
     case FgMaker::BuiltIn: return "Built-in FG";
@@ -1001,6 +1003,7 @@ const char* framegen_maker_name() {
 }
 /// Frame generation by: at Auto, who makes the frames now, so a player sees whether DLSS Frame Generation runs
 const char* tx_framegen_by(int v) {
+    if (v == 2) return "ANR FG";
     const char* who = v ? nullptr : framegen_maker_name();
     if (!who) return v ? "Built-in FG" : "Auto";
     static char b[40];
@@ -1031,6 +1034,50 @@ const char* framegen_skip_text(int why, unsigned most) {
     default: return nullptr;
     }
 }
+/// Why Apex Neural Rendering FG does not make the frames now (vk_anrfg.h AnrSkip, and the Auto multiplier's ANR_SKIP_COUNT),
+/// the row's line after "Not ANR FG now: ". most: the most made frames it makes, for ANR_SKIP_TOO_MANY
+const char* framegen_anr_skip_text(int why, unsigned most) {
+    switch (why) {
+    case ANR_SKIP_OFF: return "ANR FG is turned off for this run (RX_VK_ANR_FG=0).";
+    case ANR_SKIP_NO_DLL: return "Its nvngx_dlssg.dll is not in the game's anr-fg folder (the files of Apex's dlssg folder go there).";
+    case ANR_SKIP_START: return "Its nvngx_dlssg.dll did not start: the log says why.";
+    case ANR_SKIP_TOO_MANY: {
+        static char b[120];
+        snprintf(b, sizeof b, "It makes %u made frames at most: a lower Frame generation.", most ? most : 1u);
+        return b;
+    }
+    case ANR_SKIP_INPUTS:
+        return "No picture from a temporal Upscaler to make them from: NVIDIA DLSS or DLAA, or AMD FSR, on the Upscaler row. "
+               "The game's own menus have none.";
+    case ANR_SKIP_REFUSED: return "It refused its frames: its nr_fg log in the anr-fg folder says why.";
+    case ANR_SKIP_PLATFORM: return "ANR FG is a Windows DLL: it does not run on this system.";
+    case ANR_SKIP_COUNT: return "ANR FG makes a fixed 2x and up, not Frame generation's Auto.";
+    default: return nullptr;
+    }
+}
+/// The row's line at ANR FG: what it is, or with another making the frames, why ("Not ANR FG now: " and
+/// framegen_anr_skip_text). Variants (every one): its own, then "Not ANR FG now: " with each reason
+const char* hn_framegen_by_anr(int variant) {
+    static const char* const own =
+        "Apex Neural Rendering FG, from the nvngx_dlssg.dll in the game's anr-fg folder; the built-in one where it makes none.";
+    static char b[ANR_SKIP_COUNT + 2][400];
+    int why = ANR_SKIP_NONE;
+    unsigned most = 0;
+    if (variant >= 0) {
+        if (variant == 0) return own;
+        why = variant;   // (1 .. ANR_SKIP_COUNT: each reason, ANR_SKIP_COUNT the Auto multiplier's)
+        if (why > ANR_SKIP_COUNT) return nullptr;
+    } else {
+        const FgMaker m = opts.framegen >= 1 ? framegen_maker() : FgMaker::None;
+        if (m == FgMaker::None || m == FgMaker::Anr) return own;
+        why = opts.framegen == 1 ? (int)ANR_SKIP_COUNT : anr_fg_skip(&most);
+    }
+    const char* text = framegen_anr_skip_text(why, most);
+    if (!text) return own;
+    char* out = b[variant >= 0 ? variant : ANR_SKIP_COUNT + 1];
+    snprintf(out, sizeof b[0], "Not ANR FG now: %s", text);
+    return out;
+}
 /// Its line: at Auto with another than DLSS-G making the frames, why ("Not DLSS FG now: " and framegen_skip_text). Variants
 /// (every one): Auto's, Built-in's, then "Not DLSS FG now: " with each reason
 const char* hn_framegen_by(int v, int variant) {
@@ -1039,6 +1086,7 @@ const char* hn_framegen_by(int v, int variant) {
         "built-in one.",
         "The renderer's own: made from the finished picture alone.",
     };
+    if (v == 2) return hn_framegen_by_anr(variant);
     if (v != 0) return variant <= 0 ? t[1] : nullptr;
     static char b[FG_SKIP_COUNT + 2][400];
     int why = FG_SKIP_NONE;
@@ -1193,7 +1241,7 @@ Row rows[] = {
     {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
      "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion or camera cuts can "
      "show artifacts.", hn_framegen, false, true},
-    {TAB_GRAPHICS, "Frame generation by", &opts.framegen_by, 0, 1, 1, tx_framegen_by,
+    {TAB_GRAPHICS, "Frame generation by", &opts.framegen_by, 0, 2, 1, tx_framegen_by,
      "Who makes the frames at 2x and up. NVIDIA DLSS Frame Generation needs a temporal Upscaler (DLSS, DLAA or FSR) for "
      "the scene's depth and motion. Changes at once.", hn_framegen_by, false, true},
     {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, "When each frame is shown.", hn_pace},

@@ -55,6 +55,7 @@
 #include "dlss_math.h"
 #include "temporal_jitter.h"
 #include "upscaler_rows.h"
+#include "vk_anrfg.h"
 #include "vk_dlss.h"
 #include "vk_draw.h"
 #include "fsr3_math.h"   // (hookshot: FSR 3.1's depth constants from the projection)
@@ -1086,6 +1087,8 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     // (NVIDIA DLSS Frame Generation through NGX, vk_dlss.cpp: this frame's depth, motion and camera for the present's made
     // frames. Nothing unless the run asked for it)
     dlss_fg_inputs(cmd, f, cam.projection, cam.current, cam.jitter, motion);
+    // (Apex Neural Rendering FG, vk_anrfg.cpp: the same, where the player put its DLL in the game folder)
+    anr_fg_inputs(cmd, f, cam.projection, cam.current, cam.jitter, motion);
     s.last_frame = now;
     s.drawn_mode = draw_mode;
     s.last_jitter[0] = cam.jitter[0], s.last_jitter[1] = cam.jitter[1];

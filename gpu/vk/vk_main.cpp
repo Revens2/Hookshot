@@ -26,6 +26,7 @@ static_assert(mkwvk::kQueueGraphics == VK_QUEUE_GRAPHICS_BIT && mkwvk::kQueueCom
 #include "gpu_choice.h"
 #include "vk_menu.h"
 #include "auto_settings.h"
+#include "vk_anrfg.h"
 #include "vk_dlss.h"
 #include "vk_fsr4.h"
 #include "vk_reflex.h"
@@ -1552,6 +1553,7 @@ void mkwvk_close_asked(void) {
         prepare_stop();
         if (WaitForSingleObject(prep_ended, 10000) != WAIT_OBJECT_0) logf("vk: the preparation did not stop within 10 s: closing anyway");
     }
+    anr_fg_close();    // (Apex Neural Rendering FG: the same, vk_anrfg.cpp)
     dlss_fg_close();   // (NVIDIA DLSS Frame Generation through NGX: its feature let go before the process exits, vk_dlss.cpp)
 }
 
