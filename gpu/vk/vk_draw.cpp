@@ -34,6 +34,7 @@
 
 #include "vk_paths.h"
 #include "pipeline_cache_file.h"
+#include "pipe_memo.h"
 #include "vk_draw.h"
 #include "vk_menu.h"          // (opts.anisotropy: the Anisotropic filtering row; resolution_scale)
 #include "upscaler_rows.h"    // (upscale_lod_bias: which upscalers draw the 3D smaller)
@@ -2148,33 +2149,23 @@ VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPr
     return pl;
 }
 
-/// The pipeline entry of a draw (a new one is queued for a worker; RX_VK_SYNC_PIPELINES=1 builds it here)
-/// What a graphics pipeline was built from, so the next draw of the same material does not hash it again
-bool pipe_same(uint64_t prog, uint64_t variant, int topo, uint32_t samples, int n, uint32_t depth, const uint32_t* formats,
-               int nvattr, const uint32_t* vattr, const uint32_t* div, uint32_t blend_en, const uint64_t* blend,
-               uint32_t chmask, uint32_t poly, uint32_t clamp, uint32_t a2c, uint64_t cprog, uint64_t cvariant, int ctopo,
-               uint32_t csamples, int cn, uint32_t cdepth, const uint32_t* cformats, int cnvattr, const uint32_t* cvattr,
-               const uint32_t* cdiv, uint32_t cblend_en, const uint64_t* cblend, uint32_t cchmask, uint32_t cpoly,
-               uint32_t cclamp, uint32_t ca2c) {
-    if (prog != cprog || variant != cvariant || topo != ctopo || samples != csamples || n != cn || depth != cdepth ||
-        nvattr != cnvattr || blend_en != cblend_en || chmask != cchmask || poly != cpoly || clamp != cclamp || a2c != ca2c)
-        return false;
-    for (int i = 0; i < 8; i++)
-        if (formats[i] != cformats[i] || blend[i] != cblend[i]) return false;
-    for (int i = 0; i < 16; i++)
-        if (vattr[i] != cvattr[i] || div[i] != cdiv[i]) return false;
-    return true;
-}
+/// The pipeline entry of a draw (a new one is queued for a worker; RX_VK_SYNC_PIPELINES=1 builds it here) and what it
+/// was built from, so the next draw of the same material does not hash its key again (the compare: pipe_memo.h)
 struct PipeFast {
     bool on = false;
     PipeEntry* pe = nullptr;
-    uint64_t prog = 0, variant = 0;
-    int topo = 0, n = 0, nvattr = 0;
-    uint32_t samples = 0, depth = 0, blend_en = 0, chmask = 0, poly = 0, clamp = 0, a2c = 0;
-    uint32_t formats[8]{}, vattr[16]{}, div[16]{};
-    uint64_t blend[8]{};
+    pipe_memo::From from{};
 };
 thread_local PipeFast pipe_fast[2];
+/* (hookshot) a direct-mapped memo of this thread's pipelines, in front of the pair. A draw picks its program by its textures'
+   types (59.7% kept, 40.2% "with other textures"), so two programs alternate and the pair missed on every switch, hashing
+   the whole pipeline_key again: a slot is one address compare and the pair's own full compare. The pair stays for the two
+   programs whose slots collide. RX_VK_PIPE_MEMO=0: the pair alone. */
+thread_local PipeFast pipe_memo_slots[32];
+static const bool pipe_memo_on = [] {
+    const char* e = getenv("RX_VK_PIPE_MEMO");
+    return !e || !env_value_off(e);
+}();
 
 /// (hookshot) the stage a graphics pipeline's vertex input comes from (a fallback program's first stage is a compute one)
 const Shader::Info* vertex_info(const Program& p) {
@@ -2217,21 +2208,25 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     // the key: what is baked into it (the rest is dynamic state)
     // (hookshot: and which variant: p.key is the same for all the variants of a program by its textures' types, and a draw of
     // one ran another's shaders under its own descriptors)
-    uint32_t formats[8]{};
-    uint32_t vattr[16]{}, divs[16]{};
-    uint64_t blend[8]{};
-    for (int i = 0; i < 8 && i < at.n; i++) formats[i] = (uint32_t)at.color_format[i];
-    for (int i = 0; i < 16; i++) vattr[i] = s.vattr[i], divs[i] = s.vstream[i].divisor;
-    for (int i = 0; i < 8; i++) std::memcpy(&blend[i], &s.blend[i], 8);
+    pipe_memo::From from{};
+    from.prog = (uint64_t)(uintptr_t)&p;
+    from.key = p.key;
+    from.variant = p.variant;
+    from.nvattr = s.nvattr;
     const int topo_c = topology_class(topo);
-    const uint32_t blend_en = (uint32_t)s.color.blend_en, chmask = s.chmask.mask, poly = (uint32_t)s.poly.mode;
-    const uint32_t clamp = s.depth_clamp ? 1u : 0u, a2c = s.ms.a2c ? 1u : 0u;
+    from.topo = topo_c, from.samples = (uint32_t)at.samples, from.n = at.n, from.depth = (uint32_t)at.depth_format;
+    from.blend_en = (uint32_t)s.color.blend_en, from.chmask = s.chmask.mask, from.poly = (uint32_t)s.poly.mode;
+    from.clamp = s.depth_clamp ? 1u : 0u, from.a2c = s.ms.a2c ? 1u : 0u;
+    for (int i = 0; i < 8 && i < at.n; i++) from.formats[i] = (uint32_t)at.color_format[i];
+    for (int i = 0; i < 16; i++) from.vattr[i] = s.vattr[i], from.div[i] = s.vstream[i].divisor;
+    for (int i = 0; i < 8; i++) std::memcpy(&from.blend[i], &s.blend[i], 8);
+    PipeFast* slot = pipe_memo_on ? &pipe_memo_slots[pipe_memo::slot((uintptr_t)&p, p.variant, topo_c, at.n)] : nullptr;
+    if (slot && slot->on && slot->pe && pipe_memo::hit(from, slot->from)) {
+        FINE_N(FC_PIPE_FAST, 1);
+        return slot->pe;
+    }
     for (const PipeFast& f : pipe_fast)
-        if (f.on && f.pe &&
-            pipe_same((uint64_t)(uintptr_t)&p, p.variant, topo_c, (uint32_t)at.samples, at.n, (uint32_t)at.depth_format,
-                      formats, s.nvattr, vattr, divs, blend_en, blend, chmask, poly, clamp, a2c, f.prog, f.variant, f.topo,
-                      f.samples, f.n, f.depth, f.formats, f.nvattr, f.vattr, f.div, f.blend_en, f.blend, f.chmask, f.poly,
-                      f.clamp, f.a2c)) {
+        if (f.on && f.pe && pipe_memo::hit(from, f.from)) {
             FINE_N(FC_PIPE_FAST, 1);
             return f.pe;
         }
@@ -2239,13 +2234,8 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         if (!e) return e;
         if (!(pipe_fast[0].on && pipe_fast[0].pe == e)) pipe_fast[1] = pipe_fast[0];
         PipeFast& f = pipe_fast[0];
-        f.on = true, f.pe = e, f.prog = (uint64_t)(uintptr_t)&p, f.variant = p.variant, f.topo = topo_c;
-        f.samples = (uint32_t)at.samples, f.n = at.n, f.depth = (uint32_t)at.depth_format, f.nvattr = s.nvattr;
-        f.blend_en = blend_en, f.chmask = chmask, f.poly = poly, f.clamp = clamp, f.a2c = a2c;
-        std::memcpy(f.formats, formats, sizeof formats);
-        std::memcpy(f.vattr, vattr, sizeof vattr);
-        std::memcpy(f.div, divs, sizeof divs);
-        std::memcpy(f.blend, blend, sizeof blend);
+        f.on = true, f.pe = e, f.from = from;
+        if (slot) *slot = f;
         return e;
     };
     const uint64_t key = pipeline_key(p, s, at, topo);

@@ -27,12 +27,13 @@ def main():
     shader = (ROOT / "gpu" / "vk" / "vk_shader.cpp").read_text(encoding="utf-8")
     draw = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")
     prog = block(shader, "bool prog_same(")
-    pipe = block(draw, "bool pipe_same(")
+    pipe = (ROOT / "gpu" / "vk" / "pipe_memo.h").read_text(encoding="utf-8")
+    pipe = "\n".join(line for line in pipe.splitlines() if not line.startswith("#pragma once"))   # (pasted into a .cpp)
     choose = block(shader, "const Program* program_for(")
     if choose.index("prog_same(") > choose.index("picks[") :
         raise SystemExit("program_for hashes the inputs before checking the last answer")
     pipes = block(draw, "PipeEntry* graphics_pipeline(")
-    if pipes.index("pipe_same(") > pipes.index("mine.find("):
+    if pipes.index("pipe_memo::hit(") > pipes.index("mine.find("):
         raise SystemExit("graphics_pipeline hashes the key before checking the last pipeline")
     fixture = f'''#include <cstdint>
 #include <cstdio>
@@ -52,10 +53,25 @@ int main() {{
     CHECK(!prog_same(1, 5, 9, 3, 4, 8, 2, va, ct, 1, 5, 9, 3, 4, 1, 2, vb, cu));
     cu[1] = 3;
     CHECK(!prog_same(1, 5, 9, 3, 4, 8, 2, va, ct, 1, 5, 9, 3, 4, 8, 2, vb, cu));
-    CHECK(pipe_same(1, 2, 3, 4, 1, 5, fm, 6, va, dv, 7, bl, 8, 9, 0, 1, 1, 2, 3, 4, 1, 5, fn, 6, vb, dw, 7, bm, 8, 9, 0, 1));
-    CHECK(!pipe_same(1, 2, 3, 4, 1, 5, fm, 6, va, dv, 7, bl, 8, 9, 0, 1, 1, 99, 3, 4, 1, 5, fn, 6, vb, dw, 7, bm, 8, 9, 0, 1));
+    pipe_memo::From pa, pb;
+    auto fill = [](pipe_memo::From& f, const uint32_t* fm, const uint32_t* va, const uint32_t* dv, const uint64_t* bl) {{
+        f.prog = 1, f.variant = 2, f.topo = 3, f.samples = 4, f.n = 1, f.depth = 5, f.nvattr = 6;
+        f.blend_en = 7, f.chmask = 8, f.poly = 9, f.clamp = 0, f.a2c = 1;
+        for (int i = 0; i < 8; i++) f.formats[i] = fm[i], f.blend[i] = bl[i];
+        for (int i = 0; i < 16; i++) f.vattr[i] = va[i], f.div[i] = dv[i];
+    }};
+    fill(pa, fm, va, dv, bl);
+    fill(pb, fn, vb, dw, bm);
+    CHECK(pipe_memo::same(pa, pb));
+    pb.prog = 99;
+    CHECK(!pipe_memo::same(pa, pb));
+    pb.prog = 1;
+    pb.depth = 1;
+    CHECK(!pipe_memo::same(pa, pb));
+    pb.depth = 5;
     fn[0] = 10;
-    CHECK(!pipe_same(1, 2, 3, 4, 1, 5, fm, 6, va, dv, 7, bl, 8, 9, 0, 1, 1, 2, 3, 4, 1, 5, fn, 6, vb, dw, 7, bm, 8, 9, 0, 1));
+    fill(pb, fn, vb, dw, bm);
+    CHECK(!pipe_memo::same(pa, pb));
     std::printf("PASS: the same material keeps its program and pipeline\\n");
 }}
 '''
