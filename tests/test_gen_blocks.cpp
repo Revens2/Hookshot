@@ -19,6 +19,7 @@ namespace {
 
 constexpr uint64_t kBasePage = (1ull << 20) - 32;   // (mid-block, 32 pages before a chunk boundary)
 constexpr uint64_t kWindowPages = gen_blocks::kChunkPages + 64;
+static_assert(kBasePage % gen_blocks::kRegionPages == 480);   // (the window starts 480 pages into a region: a window-aligned one is never whole)
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 
@@ -26,6 +27,7 @@ struct Case {
     gen_blocks::Table table;
     std::vector<uint32_t> brute = std::vector<uint32_t>(kWindowPages, 0u);
     uint32_t gen = 0;
+    bool saw_region_full = false;
 
     void stamp(uint64_t first, uint64_t last) {
         CHECK(first <= last && last < kWindowPages);
@@ -129,9 +131,12 @@ int main() {
                 c.stamp(first, first);
             } else if (kind == 1) {
                 c.stamp(first, std::min(kWindowPages - 1, first + rng() % 200));
-            } else if (kind == 2) {   // (a whole 2 MB region)
-                const uint64_t a = first - first % gen_blocks::kRegionPages;
-                c.stamp(a, a + gen_blocks::kRegionPages - 1);
+            } else if (kind == 2) {   // (a whole 2 MB region, aligned on the guest's pages: the window starts 480 pages into one)
+                const uint64_t at = kBasePage + first;
+                const uint64_t region = at - at % gen_blocks::kRegionPages;
+                if (region < kBasePage || region - kBasePage + gen_blocks::kRegionPages > kWindowPages) continue;   // (a region cut by the window)
+                c.stamp(region - kBasePage, region - kBasePage + gen_blocks::kRegionPages - 1);
+                c.saw_region_full = true;
             } else {   // (a range across regions and blocks)
                 c.stamp(first, std::min(kWindowPages - 1, first + rng() % 5000));
             }
@@ -140,6 +145,7 @@ int main() {
         check_queries(c, rng, 40);
     }
     CHECK(c.gen > 0);
+    CHECK(c.saw_region_full);   // (the whole-region stamp, and so region_full, was really exercised)
     check_forgotten_block();
     std::printf("PASS: generations, written_since and written_runs match the brute-force table, blocks on and off\n");
     return 0;

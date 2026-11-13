@@ -51,8 +51,10 @@ def check_source(source):
     need("vk_memory.cpp: sync_blocks_on()", switch, ['getenv("RX_VK_SYNC_BLOCKS")', "env_value_off"])
     # (the sync: block skip behind the switch, one capture-buffer lookup a generation, one wb_learn note a dirty run)
     sync = block(mem, "void mirror_sync(Pool& p) {")
+    skip = next((line for line in sync.splitlines() if "gen_table.block_gen(page)" in line), "")
+    need("vk_memory.cpp: mirror_sync() block skip", skip, ["if (sync_blocks &&", "std::max(", "gen_table.region_full_gen(region)", "<= p.synced_gen)"])
     need("vk_memory.cpp: mirror_sync()", sync,
-         ["sync_blocks_on()", "gen_table.block_gen(page)", "gen_table.region_full_gen(region)",
+         ["const bool sync_blocks = sync_blocks_on();",
           "memo_buf = cap_bufs.find(e.gen)", "memory_note_cpu_access(note_lo, note_hi - note_lo, true)"])
     if "memory_note_cpu_access(page << kPageShift, 1ull << kPageShift, true)" in sync:
         raise SystemExit("vk_memory.cpp: mirror_sync() reports the CPU's writes once a page again, not once a dirty run")
