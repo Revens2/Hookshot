@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def check_source():
     """The eviction pass still counts its textures by reason and still logs the breakdown"""
     src = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
-    for needle in ('#include "evict_reason.h"', "evict_reason::classify(e.shifted, e.overwritten), lost, tex->bytes, tex->released)",
+    for needle in ('#include "evict_reason.h"', "evict_reason::classify(e.shifted, e.overwritten, e.behind), lost, tex->bytes, tex->released)",
                    "evict_reason::texels_lost(tex->gpu_written, e.overwritten, e.flush && flushed_ok.count(tex))",
                    "evict_reason::describe(tally, why, sizeof why)", "flushed_ok.insert(f.t)"):
         if needle not in src:

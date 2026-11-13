@@ -5033,7 +5033,7 @@ void texture_frame(uint64_t completed) {
     uint64_t fin_bytes = 0;   // (chosen by that rule in this pass)
     // (hookshot) the textures to go are chosen first and destroyed after; the write-backs among them go to the GPU in a few
     // batches (flush_textures), not one submission and one wait each: a sweep of 500 at a scene load stalled for seconds
-    struct Evict { Texture* tex; bool flush, shifted, overwritten; };
+    struct Evict { Texture* tex; bool flush, shifted, overwritten, behind; };
     std::vector<Evict> evict;
     uint64_t pending_bytes = 0;   // (chosen below, their bytes not yet off total_bytes)
     // (hookshot, RX_VK_COMPACT) a pass the compaction's hold asked for (evict_to) lets go of the dead render targets as a sweep
@@ -5089,8 +5089,9 @@ void texture_frame(uint64_t completed) {
         if (!overwritten && tex->gpu_written && !tex->released && !evict_rendered && frame_no - last < keep_rendered) continue;
         // (hookshot) under the budget too: an uploaded texture the game finalized and has not used since, an area left behind
         // (finalized_upload.h). Its texels are in guest memory, so not one upload_never marks uploaded with nothing loaded: made
-        // again it would load nothing either. Up to kPassBytes a pass
-        const bool behind = sweep && !overwritten && fin_presents && fin_bytes < finalized_upload::kPassBytes &&
+        // again it would load nothing either. A pass takes at most kPassBytes of them: one that would push it over waits
+        const bool behind = sweep && !overwritten && fin_presents &&
+            finalized_upload::fits_in_pass(fin_bytes, tex->bytes + tex->pad) &&
             finalized_upload::left_behind({tex->gpu_written, tex->texels_in_memory, tex->finalized_frame, tex->last_frame}, frame_no,
                                           fin_presents) &&
             !upload_never(*tex);
@@ -5128,7 +5129,8 @@ void texture_frame(uint64_t completed) {
         // tiled pattern over the Deku Tree's planks and Hyrule Field's path, with a 16 GB card's textures at the 6 GB budget
         // (issue 386). RX_VK_EVICT_NO_FLUSH=1: not written back, as before)
         static const bool no_flush = env_on("RX_VK_EVICT_NO_FLUSH");
-        evict.push_back({tex, !no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex), shifted, overwritten});
+        evict.push_back({tex, !no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex), shifted, overwritten,
+                         behind});
         pending_bytes += tex->bytes + tex->pad;
         if (by_hold && !overwritten) hold_live += tex->bytes + tex->pad;
         if (behind) fin_bytes += tex->bytes + tex->pad, n_fin_gone++, b_fin_gone += tex->bytes + tex->pad;
@@ -5163,10 +5165,10 @@ void texture_frame(uint64_t completed) {
         if (e.shifted) n_dead++, b_dead += tex->bytes;
         {   // (hookshot) why it goes, and whether its texels go with it (evict_reason.h). The flush above can fail: then they did
             const bool lost = evict_reason::texels_lost(tex->gpu_written, e.overwritten, e.flush && flushed_ok.count(tex));
-            tally.add(evict_reason::classify(e.shifted, e.overwritten), lost, tex->bytes, tex->released);
+            tally.add(evict_reason::classify(e.shifted, e.overwritten, e.behind), lost, tex->bytes, tex->released);
             static int lost_logged;
             if (lost && lost_logged++ < 100)
-                // (always over the budget: a sweep lets only drawn-over textures go, and those lose nothing)
+                // (always over the budget: a sweep lets only drawn-over or left-behind textures go, and those lose nothing)
                 logf("vk: texture #%u %#llx %ux%ux%u x%u NVN %#x the GPU drew goes with no copy of its texels (%s, unused for %llu "
                      "frames, over the budget): made again over this storage, it starts empty", tex->id, (unsigned long long)tex->gpu,
                      tex->width, tex->height, tex->depth, tex->layers, tex->nvn_format, tex->released ? "finalized" : "live",

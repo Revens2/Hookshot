@@ -19,7 +19,7 @@ def check_source():
                    "if (sweep && !overwritten && !behind) continue;",
                    "!upload_never(*tex);",
                    "if (behind) fin_bytes += tex->bytes + tex->pad",
-                   "fin_bytes < finalized_upload::kPassBytes"):
+                   "finalized_upload::fits_in_pass(fin_bytes, tex->bytes + tex->pad)"):
         if needle not in src:
             raise SystemExit("vk_texture.cpp no longer has: " + needle)
     # (a re-upload or a GPU write clears the stamp: two sites, next to released = false)

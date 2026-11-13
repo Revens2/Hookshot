@@ -43,4 +43,8 @@ inline bool left_behind(const State& s, uint64_t frame_no, uint64_t presents) {
 // What one pass lets go of at most, so a whole area's textures do not go in one burst of destroys
 constexpr uint64_t kPassBytes = 256ull << 20;
 
+// Whether a texture still fits in a pass that has let go of used bytes: hard, so one bigger than the whole cap (a course map,
+// 349 MB) is not taken alone and the pass never goes over it. That one waits for the budget's rule
+inline bool fits_in_pass(uint64_t used, uint64_t bytes) { return bytes <= kPassBytes && used <= kPassBytes - bytes; }
+
 } // namespace finalized_upload

@@ -14,11 +14,14 @@ enum Reason : int {
     BUDGET,       // over the budget: the least recently used
     DRAWN_OVER,   // a render target another image has drawn over at the same start since its last use
     DEAD,         // a transient render target whose storage another one drew over from another start (target_overlap.h)
+    LEFT_BEHIND,  // an uploaded texture the game finalized and left unused (finalized_upload.h), under the budget
     COUNT
 };
 
-// (the most specific first: a shifted one is also "overwritten")
-inline Reason classify(bool shifted, bool overwritten) { return shifted ? DEAD : overwritten ? DRAWN_OVER : BUDGET; }
+// (the most specific first: a shifted one is also "overwritten"; a left-behind one is neither)
+inline Reason classify(bool shifted, bool overwritten, bool left_behind = false) {
+    return left_behind ? LEFT_BEHIND : shifted ? DEAD : overwritten ? DRAWN_OVER : BUDGET;
+}
 
 // A texture the GPU drew, that nothing drew over, going without a write-back into its memory: its image held the only copy, and
 // one made again over that storage is not uploaded (the storage counts as the GPU's). That is how a terrain chunk's normal map
@@ -33,14 +36,19 @@ struct Tally {
         n[r]++;
         if (lost_texels) lost++, lost_bytes += bytes, lost_finalized += finalized;
     }
-    uint32_t total() const { return n[BUDGET] + n[DRAWN_OVER] + n[DEAD]; }
+    uint32_t total() const { return n[BUDGET] + n[DRAWN_OVER] + n[DEAD] + n[LEFT_BEHIND]; }
 };
 
-// "budget 3, drawn over 1, dead targets 40; GPU-drawn with no copy kept: 2 live, 5 finalized, 1 MB": what follows the count in
-// the log line
+// "budget 3, drawn over 1, dead targets 40, left behind 2; GPU-drawn with no copy kept: 2 live, 5 finalized, 1 MB": what follows
+// the count in the log line (left behind only when there are: an older log's line reads as before)
 inline int describe(const Tally& t, char* out, size_t size) {
-    const int n = std::snprintf(out, size, "budget %u, drawn over %u, dead targets %u", t.n[BUDGET], t.n[DRAWN_OVER], t.n[DEAD]);
-    if (n < 0 || (size_t)n >= size || !t.lost) return n;
+    int n = std::snprintf(out, size, "budget %u, drawn over %u, dead targets %u", t.n[BUDGET], t.n[DRAWN_OVER], t.n[DEAD]);
+    if (n < 0 || (size_t)n >= size) return n;
+    if (t.n[LEFT_BEHIND]) {
+        n += std::snprintf(out + n, size - (size_t)n, ", left behind %u", t.n[LEFT_BEHIND]);
+        if ((size_t)n >= size) return n;
+    }
+    if (!t.lost) return n;
     return n + std::snprintf(out + n, size - (size_t)n, "; GPU-drawn with no copy kept: %u live, %u finalized, %llu MB",
                              t.lost - t.lost_finalized, t.lost_finalized, (unsigned long long)(t.lost_bytes >> 20));
 }

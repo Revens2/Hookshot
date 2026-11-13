@@ -14,10 +14,13 @@ static void expect(bool ok, const char* what) {
 }
 
 int main() {
+    using finalized_upload::fits_in_pass;
+    using finalized_upload::kPassBytes;
     using finalized_upload::left_behind;
     using finalized_upload::presents_from_env;
     using finalized_upload::State;
     const uint64_t P = 1800;
+    const uint64_t MB = 1ull << 20;
 
     // (finalized at 1000, last used at 1002: the frames in flight then)
     const State done{false, true, 1000, 1002};
@@ -44,6 +47,14 @@ int main() {
     expect(presents_from_env("3600") == 3600, "a number of presents");
     expect(presents_from_env("1") == finalized_upload::kDefaultPresents, "1 (on): the default");
     expect(presents_from_env("on") == finalized_upload::kDefaultPresents, "on: the default");
+
+    // (the pass's cap: hard, a texture that would push it over is not taken, even alone)
+    expect(!fits_in_pass(0, 349 * MB), "a 349 MB course map over the cap alone: never in one pass");
+    expect(fits_in_pass(0, kPassBytes), "a texture of exactly the cap, alone: taken");
+    expect(fits_in_pass(100 * MB, 156 * MB), "filling the pass to exactly the cap: taken");
+    expect(!fits_in_pass(100 * MB, 156 * MB + 1), "one byte over the cap: not taken");
+    expect(!fits_in_pass(kPassBytes, 1), "the pass already full: nothing more");
+    expect(!fits_in_pass(1, kPassBytes), "a full-cap texture with the pass not empty: not taken");
 
     if (failures) return EXIT_FAILURE;
     std::printf("finalized upload: all checks passed\n");

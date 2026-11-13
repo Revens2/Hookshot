@@ -20,6 +20,8 @@ int main() {
     expect(classify(false, true) == DRAWN_OVER, "drawn over at the same start");
     expect(classify(true, true) == DEAD, "shifted over (also overwritten): a dead target");
     expect(classify(true, false) == DEAD, "shifted alone: a dead target");
+    expect(classify(false, false, true) == LEFT_BEHIND, "an uploaded finalized texture left behind: its own reason");
+    expect(classify(true, true, true) == LEFT_BEHIND, "left behind is the most specific (never both in practice)");
 
     expect(!texels_lost(false, false, false), "uploaded from the game's memory: made again from there");
     expect(texels_lost(true, false, false), "drawn by the GPU, no write-back, nothing drawn over it: lost");
@@ -32,17 +34,24 @@ int main() {
     t.add(BUDGET, true, 3 << 20);
     t.add(DEAD, false, 8 << 20);
     t.add(DRAWN_OVER, true, 1 << 20, true);
-    expect(t.total() == 4 && t.n[BUDGET] == 2 && t.n[DEAD] == 1 && t.n[DRAWN_OVER] == 1, "counts by reason");
+    t.add(LEFT_BEHIND, false, 32 << 20);
+    expect(t.total() == 5 && t.n[BUDGET] == 2 && t.n[DEAD] == 1 && t.n[DRAWN_OVER] == 1 && t.n[LEFT_BEHIND] == 1,
+           "counts by reason");
     expect(t.lost == 2 && t.lost_bytes == (4ull << 20), "the lost ones and their bytes");
     expect(t.lost_finalized == 1, "of them, the finalized one");
 
     char line[160];
     describe(t, line, sizeof line);
-    expect(!std::strcmp(line, "budget 2, drawn over 1, dead targets 1; GPU-drawn with no copy kept: 1 live, 1 finalized, 4 MB"), line);
+    expect(!std::strcmp(line, "budget 2, drawn over 1, dead targets 1, left behind 1; GPU-drawn with no copy kept: 1 live, 1 "
+                              "finalized, 4 MB"), line);
+    Tally behind_only;
+    behind_only.add(LEFT_BEHIND, false, 1 << 20);
+    describe(behind_only, line, sizeof line);
+    expect(!std::strcmp(line, "budget 0, drawn over 0, dead targets 0, left behind 1"), "left behind alone: its label, no lost part");
     Tally clean;
     clean.add(DEAD, false, 1);
     describe(clean, line, sizeof line);
-    expect(!std::strcmp(line, "budget 0, drawn over 0, dead targets 1"), "nothing lost: no second part");
+    expect(!std::strcmp(line, "budget 0, drawn over 0, dead targets 1"), "nothing lost and none left behind: no second part");
     char tiny[8];
     describe(t, tiny, sizeof tiny);
     expect(std::strlen(tiny) == sizeof tiny - 1, "a short buffer: cut, still terminated");
