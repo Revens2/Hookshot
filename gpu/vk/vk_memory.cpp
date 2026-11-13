@@ -1382,7 +1382,9 @@ SnapEntry* snap_get(uint64_t value) {
     for (SnapEntry& e : snap_entries) {
         if (e.value > mem_completed || e.last_use > mem_completed) continue;
         if (!e.buf) {
-            if (!create_device_buffer(kSnapEntryBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            // (TRANSFER_SRC: every merge copies its pages out of this snapshot into its own scratch)
+            if (!create_device_buffer(kSnapEntryBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                                       e.buf, e.alloc)) {
                 e.value = value;   // (no room: not retried until this one is done)
@@ -1431,7 +1433,8 @@ bool snap_lookup(uint64_t value, uint64_t lo, uint64_t at, uint64_t use, VkBuffe
 }
 /// (hookshot, #2655) A merge's own copy of its snapshots: wb_diff.comp's word path writes its shadow (s) as well as its
 /// guest, so two captures of the same write-back sharing one snapshot would let the first merge patch it and the second,
-/// seeing v == s, skip the diff's words and keep stale bytes. One scratch a merge, reused once its submission is done.
+/// seeing v == s, skip the diff's words and keep stale bytes. One scratch a merge: held by the submission that reads it
+/// (value) and the recording that takes it (last_use = mem_rec_value), reused once both are done.
 constexpr int kMergeScratchEntries = 4;
 struct MergeScratch {
     VkBuffer buf = VK_NULL_HANDLE;
@@ -1444,7 +1447,10 @@ MergeScratch* merge_scratch_get(uint64_t need, uint64_t value) {
     MergeScratch* spare = nullptr;
     for (MergeScratch& s : merge_scratch) {
         if (s.value > mem_completed || s.last_use > mem_completed) continue;
-        if (s.bytes >= need) { s.value = value, s.last_use = 0; return &s; }
+        if (s.bytes >= need) {
+            s.value = value, s.last_use = mem_rec_value;
+            return &s;
+        }
         if (!spare) spare = &s;   // (too small: recreated below, a larger merge's need)
     }
     if (!spare) return nullptr;   // (every scratch in use: the caller keeps the CPU wait)
@@ -1453,7 +1459,7 @@ MergeScratch* merge_scratch_get(uint64_t need, uint64_t value) {
     if (!create_device_buffer(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                               spare->buf, spare->alloc)) {
-        spare->value = value;   // (no room: not retried until this one is done)
+        spare->value = std::max(value, mem_rec_value);   // (no room: not retried until these are done)
         return nullptr;
     }
     VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -1461,10 +1467,10 @@ MergeScratch* merge_scratch_get(uint64_t need, uint64_t value) {
     spare->address = vkGetBufferDeviceAddress(dev.device, &da);
     if (!spare->address) {
         destroy_buffer(spare->buf, spare->alloc);
-        spare->buf = VK_NULL_HANDLE, spare->value = value;
+        spare->buf = VK_NULL_HANDLE, spare->value = std::max(value, mem_rec_value);
         return nullptr;
     }
-    spare->bytes = need, spare->value = value, spare->last_use = 0;
+    spare->bytes = need, spare->value = value, spare->last_use = mem_rec_value;
     return spare;
 }
 /// (hookshot, #2655) The kept late pages merged in the recording's upload command buffer (the write-back's diff, word mode,

@@ -77,6 +77,11 @@ def main():
         raise SystemExit("late_merge_record: the chunks do not read the merge's own copy at the page's snapshot offset")
     if "s.value > mem_completed || s.last_use > mem_completed" not in scratch:
         raise SystemExit("merge_scratch_get: the scratch is not reused only once the submission that read it is done")
+    if "last_use = mem_rec_value" not in scratch:
+        raise SystemExit("merge_scratch_get: the scratch is not held by the recording that takes it (last_use = mem_rec_value)")
+    snap_get_block = block(source, "SnapEntry* snap_get(")
+    if "VK_BUFFER_USAGE_TRANSFER_SRC_BIT" not in snap_get_block:
+        raise SystemExit("snap_get: the snapshot cannot be a copy source (each merge copies it into its own scratch)")
     if "VK_BUFFER_USAGE_TRANSFER_SRC_BIT" not in shadow:
         raise SystemExit("shadow_make: the shadow cannot be a copy source (the snapshot reads it)")
     usage = source[source.index("constexpr VkBufferUsageFlags kCapBufferUsage"):]
