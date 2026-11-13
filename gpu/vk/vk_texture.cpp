@@ -58,6 +58,7 @@
 #include "vram_compact.h"
 #include "evict_reason.h"
 #include "keep_rendered.h"
+#include "finalized_upload.h"
 #include "target_overlap.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
@@ -2939,6 +2940,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     watch_tex(tex, owned ? "sampled, over rendered storage" : "sampled, uploaded");
     if (owned && !texture_dirty(*tex, owned, dirty)) {
         tex->uploaded = true;
+        tex->texels_in_memory = false;   // (not from memory: finalized_upload.h leaves it alone)
         tex->upload_gen = gen;
         watch_tex(tex, "NOT uploaded (over storage the GPU rendered)");
         if (remade_log_on()) {   // (made again after its eviction, and sampled empty)
@@ -3047,12 +3049,15 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
             }
         }
         tex->uploaded = true;
+        tex->texels_in_memory = true;
         tex->upload_gen = gen;
         tex->gpu_written = false;
         tex->released = false;
+        tex->finalized_frame = 0;
         tex->retry_frame = 0;
     } else if (upload_never(*tex)) {
         tex->uploaded = true;   // (nothing to try again)
+        tex->texels_in_memory = false;
         tex->upload_gen = gen;
     } else {
         // (hookshot) a BC3 image holds nothing until its encode has run. Marked uploaded, its blocks as the memory had them
@@ -3885,6 +3890,7 @@ int texture_flush_to_guest(uint64_t lo, uint64_t size) {
         // (its memory is its content now: CPU writes to it count again, and an image made over it uploads it)
         t->gpu_written = false;
         t->uploaded = true;
+        t->texels_in_memory = true;   // (written back: its memory holds its texels)
         t->upload_gen = memory_generation();
         watch_tex(t, "written back into its memory");
     }
@@ -3936,6 +3942,8 @@ void texture_written(Texture* tex, const char* why) {
     tex->gpu_written = true;
     tex->gpu_gen = memory_generation();
     tex->released = false;
+    tex->finalized_frame = 0;
+    tex->texels_in_memory = false;   // (the GPU's content now)
     tex->uploaded = true;
 }
 
@@ -4835,8 +4843,8 @@ void texture_frame(uint64_t completed) {
              (unsigned long long)(budget >> 20), textures.size(),
              known && used > allowed / 100 * 97 && room_in_blocks ? " (at the driver's limit, room in the blocks: not squeezed)" : "");
         // (what takes it: decoded ASTC, the GPU's images, the rest; the largest)
-        uint64_t astc_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0;
-        size_t baked_n = 0;
+        uint64_t astc_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0, fin_kept_b = 0;
+        size_t baked_n = 0, fin_kept_n = 0;
         std::vector<const Texture*> big, baked;
         size_t bucket_n[4]{}, bucket_rel[4]{};
         uint64_t bucket_b[4]{};
@@ -4844,6 +4852,8 @@ void texture_frame(uint64_t completed) {
             const Texture* t = kv.second.get();
             (t->astc ? astc_b : t->gpu_written ? rt_b : other_b) += t->bytes;
             if (frame_no - t->last_frame < 8) recent_b += t->bytes;
+            if (!t->gpu_written && t->texels_in_memory && t->finalized_frame && t->last_frame <= t->finalized_frame + 8)
+                fin_kept_n++, fin_kept_b += t->bytes;
             if (t->gpu_written && t->first_written && t->first_written == t->last_written && t->bytes <= (4ull << 20)) {
                 if (!t->released) baked_n++, baked_b += t->bytes;
                 const int k = t->bytes <= (64u << 10) ? 0 : t->bytes <= (256u << 10) ? 1 : t->bytes <= (1u << 20) ? 2 : 3;
@@ -4873,6 +4883,8 @@ void texture_frame(uint64_t completed) {
              "used in the last 8 presents %llu MB", (unsigned long long)(astc_b >> 20), (unsigned long long)(rt_b >> 20),
              baked_n, (unsigned long long)(baked_b >> 10), (unsigned long long)(other_b >> 20),
              (unsigned long long)(recent_b >> 20));
+        logf("vk: uploaded textures the game finalized, not sampled since (let go once unused long enough): %zu (%llu MB)",
+             fin_kept_n, (unsigned long long)(fin_kept_b >> 20));
         for (size_t i = 0; i < big.size() && i < 8; i++)
             logf("vk:   %llu MB: %#llx %ux%ux%u x%u levels %u NVN %#x%s%s, last used %llu presents ago",
                  (unsigned long long)(big[i]->bytes >> 20), (unsigned long long)big[i]->gpu, big[i]->width, big[i]->height,
@@ -5015,6 +5027,10 @@ void texture_frame(uint64_t completed) {
     const uint64_t need_unused = sweep ? std::max<uint64_t>(120, min_unused) : min_unused;
     const uint64_t need_dead = dead_targets ? std::min(need_unused, dead_min_unused) : need_unused;
     static uint64_t n_dead, b_dead, dead_logged_at;
+    // (the finalized uploads left behind: finalized_upload.h. RX_VK_FINALIZED_UPLOADS=<presents>, 0: kept as before)
+    static const uint64_t fin_presents = finalized_upload::presents_from_env(getenv("RX_VK_FINALIZED_UPLOADS"));
+    static uint64_t n_fin_gone, b_fin_gone, fin_logged_at;
+    uint64_t fin_bytes = 0;   // (chosen by that rule in this pass)
     // (hookshot) the textures to go are chosen first and destroyed after; the write-backs among them go to the GPU in a few
     // batches (flush_textures), not one submission and one wait each: a sweep of 500 at a scene load stalled for seconds
     struct Evict { Texture* tex; bool flush, shifted, overwritten; };
@@ -5071,7 +5087,14 @@ void texture_frame(uint64_t completed) {
                      tex->height, tex->nvn_format, (unsigned long long)(frame_no - last));
         }
         if (!overwritten && tex->gpu_written && !tex->released && !evict_rendered && frame_no - last < keep_rendered) continue;
-        if (sweep && !overwritten) continue;
+        // (hookshot) under the budget too: an uploaded texture the game finalized and has not used since, an area left behind
+        // (finalized_upload.h). Its texels are in guest memory, so not one upload_never marks uploaded with nothing loaded: made
+        // again it would load nothing either. Up to kPassBytes a pass
+        const bool behind = sweep && !overwritten && fin_presents && fin_bytes < finalized_upload::kPassBytes &&
+            finalized_upload::left_behind({tex->gpu_written, tex->texels_in_memory, tex->finalized_frame, tex->last_frame}, frame_no,
+                                          fin_presents) &&
+            !upload_never(*tex);
+        if (sweep && !overwritten && !behind) continue;
         // (hookshot) nor a live texture the GPU drew whose texels cannot be written back into its memory (ASTC kept as BC3, sparse,
         // past the write-back's size, ...): its image is the only copy, and one made again over that storage is not uploaded (the
         // memory counts as the GPU's), so it showed whatever its new memory held: the rainbow/garbled textures that spread over play
@@ -5108,6 +5131,7 @@ void texture_frame(uint64_t completed) {
         evict.push_back({tex, !no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex), shifted, overwritten});
         pending_bytes += tex->bytes + tex->pad;
         if (by_hold && !overwritten) hold_live += tex->bytes + tex->pad;
+        if (behind) fin_bytes += tex->bytes + tex->pad, n_fin_gone++, b_fin_gone += tex->bytes + tex->pad;
     }
     evict_reason::Tally tally;                     // (why each one goes: the retired line below)
     std::unordered_set<const Texture*> flushed_ok;   // (the write-backs that worked)
@@ -5173,6 +5197,11 @@ void texture_frame(uint64_t completed) {
         logf("vk: render targets drawn over from another start, let go: %llu so far (%llu MB)", (unsigned long long)n_dead,
              (unsigned long long)(b_dead >> 20));
     }
+    if (n_fin_gone && frame_no >= fin_logged_at + 600) {   // (the finalized uploads left behind let go so far, every 600 presents)
+        fin_logged_at = frame_no;
+        logf("vk: uploaded textures the game finalized, unused for %llu presents, let go under the budget: %llu so far (%llu MB)",
+             (unsigned long long)fin_presents, (unsigned long long)n_fin_gone, (unsigned long long)(b_fin_gone >> 20));
+    }
     const size_t n = order.size() - textures.size();
     if (n) {
         char why[160];
@@ -5214,7 +5243,13 @@ void texture_log_guest(const Texture* t) {
 void texture_released(const nvn_tex* t) {
     if (!t) return;
     auto [a, b] = by_gpu.equal_range(t->gpu);
-    for (auto it = a; it != b; ++it)
+    for (auto it = a; it != b; ++it) {
+        // (hookshot) one uploaded from guest memory: when, for the eviction pass's areas left behind (finalized_upload.h).
+        // Each finalize stamps it again: one made again over its storage, sampled and finalized again, counts from the last
+        if (!it->second->gpu_written && it->second->texels_in_memory) {
+            it->second->finalized_frame = frame_no;
+            continue;
+        }
         if (it->second->gpu_written && !it->second->released) {
             it->second->released = true, it->second->release_gen = memory_generation();
             watch_tex(it->second, "finalized");
@@ -5224,6 +5259,7 @@ void texture_released(const nvn_tex* t) {
                      it->second->id, (unsigned long long)it->second->gpu, it->second->width, it->second->height,
                      it->second->layers, it->second->nvn_format, (unsigned long long)(it->second->bytes >> 20));
         }
+    }
 }
 
 uint64_t texture_made() {

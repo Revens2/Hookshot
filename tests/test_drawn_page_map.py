@@ -93,6 +93,8 @@ struct Texture {   // (the fields the code cut out uses, as gpu/vk/vk_texture.h 
     uint32_t gpu_gen = 0;
     bool released = false;
     uint32_t release_gen = 0;
+    uint64_t finalized_frame = 0;   // (finalized_upload.h: stamped by texture_released, cleared by texture_written)
+    bool texels_in_memory = false;
     uint64_t last_written = 0, first_written = 0, upload_value = 0, upload_seg = 0, bytes = 0;
     uint32_t id = 0;
     uint64_t first_seen = 0;
