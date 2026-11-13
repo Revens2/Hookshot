@@ -28,6 +28,7 @@
 
 #include "vk_internal.h"
 #include "vk_texture.h"   // (upload_command_buffer)
+#include "late_snap.h"    // (the late copy merge's snapshot pick)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
 #include "import_hold.h"
 #include "import_fence.h"
@@ -1367,7 +1368,7 @@ bool late_copy_still_valid(bool same_shadow, bool known, uint64_t planned_wb, ui
 /// (tests/test_capture_late_merge.py)
 constexpr uint64_t kSnapEntryBytes = 1u << 20;   // (a submission's fill pages: the pages the CPU wrote, 256 of them)
 constexpr int kSnapEntries = 8;
-struct SnapRange { uint64_t lo, at, len, off; };
+using SnapRange = mkwvk::late_snap::Range;
 struct SnapEntry {
     VkBuffer buf = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
@@ -1416,34 +1417,20 @@ void snap_record(VkCommandBuffer cmd, const Pool& p, const std::vector<VkBufferC
     }
     if (!copies.empty()) vkCmdCopyBuffer(cmd, p.shadow, e.buf, (uint32_t)copies.size(), copies.data());
 }
-/// (hookshot, #2655) A snapshot range holds the page [at, at + 4 KB) of the pool at lo
-bool snap_range_holds(const SnapRange& r, uint64_t lo, uint64_t at) {
-    return r.lo == lo && at >= r.at && at + ((uint64_t)1 << kPageShift) <= r.at + r.len;
-}
-/// (hookshot, #2655) The newest of two snapshots of one page: a submission's parts share a value and keep an entry each, so
-/// a page filled again in a later part resolves to that part's fill (the one before the last diff), not the first's.
-/// tests/test_capture_late_merge.py
-bool snap_seq_newer(uint64_t seq, uint64_t best) { return seq > best; }
 /// (hookshot, #2655) The pre-diff shadow of a late page's write-back, and the use that keeps the entry until the reading
 /// submission is done (pools_mu held); false when the page was not one of that write-back's fill pages (no snapshot: the
 /// page was known then, and its post-diff shadow is no reference for the capture: the CPU wait). A page filled by several
-/// parts of the submission takes the newest fill; the buffer and offset, not an address: every merge copies the page into
-/// its own scratch (the word path writes its shadow)
+/// parts of the submission takes the newest fill (late_snap::pick, the rule the test compiles); the buffer and offset, not
+/// an address: every merge copies the page into its own scratch (the word path writes its shadow)
 bool snap_lookup(uint64_t value, uint64_t lo, uint64_t at, uint64_t use, VkBuffer& buf, uint64_t& off) {
     if (!value) return false;
-    SnapEntry* hit = nullptr;
-    uint64_t hit_off = 0, best = 0;
-    for (SnapEntry& e : snap_entries) {
-        if (!e.buf || e.value != value) continue;
-        for (const SnapRange& r : e.ranges) {
-            if (!snap_range_holds(r, lo, at)) continue;
-            if (hit && !snap_seq_newer(e.seq, best)) continue;
-            hit = &e, hit_off = r.off + (at - r.at), best = e.seq;
-        }
-    }
-    if (!hit) return false;
-    hit->last_use = std::max(hit->last_use, use);
-    buf = hit->buf, off = hit_off;
+    mkwvk::late_snap::Hit snap{};
+    const auto holds_value = [value](const SnapEntry& e) { return e.buf && e.value == value; };
+    const int best = mkwvk::late_snap::pick(snap_entries, holds_value, lo, at, (uint64_t)1 << kPageShift, snap);
+    if (best < 0) return false;
+    SnapEntry& hit = snap_entries[best];
+    hit.last_use = std::max(hit.last_use, use);
+    buf = hit.buf, off = snap.off;
     return true;
 }
 /// (hookshot, #2655) A merge's own copy of its snapshots: wb_diff.comp's word path writes its shadow (s) as well as its
