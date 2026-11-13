@@ -43,10 +43,16 @@ def main():
         raise SystemExit("C++ compiler not found: " + args.cxx)
     source = args.source.read_text(encoding="utf-8")
     header = (ROOT / "gpu/vk/vk_internal.h").read_text(encoding="utf-8")
-    declarations = "\n".join(re.findall(r"^constexpr uint64_t [^;\n]+;", source, re.M))
+    # (the page-table dimensions live in gen_blocks.h; a source override older than it still defines them itself)
+    source_declarations = "\n".join(re.findall(r"^constexpr uint64_t [^;\n]+;", source, re.M))
+    gen_blocks = args.source.resolve().parent / "gen_blocks.h"
+    if not gen_blocks.exists():
+        gen_blocks = ROOT / "gpu/vk/gen_blocks.h"
+    header_declarations = "\n".join(re.findall(r"^constexpr uint64_t [^;\n]+;", gen_blocks.read_text(encoding="utf-8"), re.M))
     dimensions = []
     for name in ("kPageShift", "kChunkPages", "kPages"):
-        value = re.search(r"\b" + name + r"\s*=\s*([^,;]+)[,;]", declarations)
+        value = re.search(r"\b" + name + r"\s*=\s*([^,;]+)[,;]", source_declarations) or \
+                re.search(r"\b" + name + r"\s*=\s*([^,;]+)[,;]", header_declarations)
         assert value, "Missing production page-table dimension: " + name
         dimensions.append("constexpr uint64_t %s = %s;" % (name, value[1]))
     types = "\n".join(dimensions) + "\n\n" + "\n\n".join([block(header, "struct BufferRef {", True), block(source, "struct Pool {", True),

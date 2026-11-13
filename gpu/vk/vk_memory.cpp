@@ -34,6 +34,7 @@
 #include "mirror_trim.h"
 #include "wb_learn.h"
 #include "mirror_inherit.h"
+#include "gen_blocks.h"
 #include "retired_give_back.h"
 #ifdef __linux__
 #include <cerrno>
@@ -676,40 +677,33 @@ void memory_sync() {
 }
 
 // ---- page write generations ----
-// Two levels over the guest's 512 GB (2^27 pages of 4 KB): chunks of 64K page generations made when a page of the
-// chunk is first stamped, and the newest generation of each 2 MB region (512 pages), which lets a check skip a big
-// texture's clean regions without looking at their pages. 0: never written.
+// gen_blocks.h: chunks of 64K page generations, the newest generation of each 2 MB region (a clean region is skipped),
+// and of each 64-page block within a dirty one (mirror_sync probes a dirty region's pages; one dirty page made all 512
+// of them examined). A whole-region stamp marks regions, not 512 pages each: it took dispatches 8-150 ms. 0: never
+// written.
 namespace {
-constexpr uint64_t kPageShift = 12, kChunkPages = 1u << 16, kRegionPages = 512;
-constexpr uint64_t kPages = 1ull << 27;
-std::vector<std::unique_ptr<uint32_t[]>> gen_chunks(kPages / kChunkPages);
-std::vector<uint32_t> region_gen(kPages / kRegionPages);
-// (and the generation every page of a region was written at, at least: a large stamp (a storage buffer a dispatch may
-// write, hundreds of MB) marks whole regions, not 512 pages each; it took dispatches 8-150 ms)
-std::vector<uint32_t> region_full(kPages / kRegionPages);
-inline uint32_t load_u32(uint32_t& x) {
-    return std::atomic_ref<uint32_t>(x).load(std::memory_order_acquire);
-}
-inline void store_u32(uint32_t& x, uint32_t v) {
-    std::atomic_ref<uint32_t>(x).store(v, std::memory_order_release);
-}
+using gen_blocks::kBlockPages;
+using gen_blocks::kChunkPages;
+using gen_blocks::kPageShift;
+using gen_blocks::kPages;
+using gen_blocks::kRegionPages;
+gen_blocks::Table gen_table;
 inline uint32_t page_gen(uint64_t p) {
-    const auto& c = gen_chunks[p / kChunkPages];
-    return std::max(c ? load_u32(c[p % kChunkPages]) : 0u, load_u32(region_full[p / kRegionPages]));
+    return gen_table.page_gen(p);
+}
+void stamp_page(uint64_t p, uint32_t g) {
+    gen_table.stamp_page(p, g);
+}
+// (RX_VK_SYNC_BLOCKS=0: a dirty region's pages all examined, as before the block level; on unless an off value)
+bool sync_blocks_on() {
+    static const bool v = [] {
+        const char* e = getenv("RX_VK_SYNC_BLOCKS");
+        return !e || !env_value_off(e);
+    }();
+    return v;
 }
 uint32_t gen_now = 1;
 uint64_t pages_collected = 0;
-
-void stamp_page(uint64_t p, uint32_t g) {
-    if (p >= kPages) return;
-    auto& c = gen_chunks[p / kChunkPages];
-    if (!c) {
-        c.reset(new uint32_t[kChunkPages]);
-        std::fill(c.get(), c.get() + kChunkPages, 0u);
-    }
-    store_u32(c[p % kChunkPages], g);
-    region_gen[p / kRegionPages] = g;
-}
 } // namespace
 
 namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
@@ -750,31 +744,10 @@ uint32_t memory_generation() {
     return gen_now;
 }
 bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen) {
-    if (!size) return false;
-    const uint64_t p0 = guest >> kPageShift, p1 = std::min((guest + size - 1) >> kPageShift, kPages - 1);
-    for (uint64_t r = p0 / kRegionPages; r <= p1 / kRegionPages; r++) {
-        if (region_gen[r] <= gen) continue;
-        if (load_u32(region_full[r]) > gen) return true;
-        const uint64_t a = std::max(p0, r * kRegionPages), b = std::min(p1, r * kRegionPages + kRegionPages - 1);
-        for (uint64_t p = a; p <= b; p++)
-            if (page_gen(p) > gen) return true;
-    }
-    return false;
+    return gen_table.written_since(guest, size, gen, sync_blocks_on());
 }
 void memory_written_runs(uint64_t guest, uint64_t size, uint32_t gen, std::vector<std::pair<uint64_t, uint64_t>>& out) {
-    if (!size) return;
-    const uint64_t p0 = guest >> kPageShift, p1 = std::min((guest + size - 1) >> kPageShift, kPages - 1);
-    for (uint64_t r = p0 / kRegionPages; r <= p1 / kRegionPages; r++) {
-        if (region_gen[r] <= gen) continue;
-        const uint64_t a = std::max(p0, r * kRegionPages), b = std::min(p1, r * kRegionPages + kRegionPages - 1);
-        for (uint64_t p = a; p <= b; p++) {
-            if (page_gen(p) <= gen) continue;
-            const uint64_t lo = std::max(p << kPageShift, guest) - guest;
-            const uint64_t hi = std::min((p + 1) << kPageShift, guest + size) - guest;
-            if (!out.empty() && out.back().second == lo) out.back().second = hi;
-            else out.push_back({lo, hi});
-        }
-    }
+    gen_table.written_runs(guest, size, gen, out, sync_blocks_on());
 }
 void memory_drop_shadow(uint64_t guest, uint64_t size);
 // (a GPU write: RX_VK_GPU_PAGES=1 notes the pages, and the mirror syncs that copy the CPU's version of one over the
@@ -846,15 +819,7 @@ void memory_stamp(uint64_t guest, uint64_t size) {
     memory_drop_shadow(guest, size);   // (a write the capture did not take: guest memory is newer than its copy)
     const uint32_t g = ++gen_now;
     const uint64_t p0 = guest >> kPageShift, p1 = std::min((guest + size - 1) >> kPageShift, kPages - 1);
-    for (uint64_t p = p0; p <= p1;) {
-        if (p % kRegionPages == 0 && p + kRegionPages - 1 <= p1) {   // (a whole region)
-            store_u32(region_full[p / kRegionPages], g);
-            region_gen[p / kRegionPages] = g;
-            p += kRegionPages;
-            continue;
-        }
-        stamp_page(p++, g);
-    }
+    gen_table.stamp_range(p0, p1, g);
     cap_view_bump();   // (a replay read's cached page is this generation's answer, not the one from before the write)
 }
 uint64_t memory_pages_collected() {
@@ -2649,6 +2614,7 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
+int64_t st_sync_examined, st_sync_dirty_regions, st_sync_blocks_skipped, st_sync_cap_lookups;   // (P2: pages probed, dirty regions entered, blocks skipped, cap_bufs finds)
 std::unordered_map<uint64_t, int64_t> live_by_pool;
 std::unordered_map<uint64_t, std::pair<int64_t, int>> direct_by_pool;   // (bindings the GPU reads in guest memory: count, state)
 std::unordered_map<uint64_t, uint64_t> direct_bytes_by_pool;           // (and the bytes of those bindings: what the GPU may read over PCIe, a binding's whole range)
@@ -2684,14 +2650,49 @@ void mirror_sync(Pool& p) {
     uint64_t run_lo = 0, run_hi = 0;
     const uint64_t end_page = (p.hi + 4095) >> kPageShift;
     const bool note_writes = memory_wb_followed(p.lo, p.hi);   // (wb_learn.h: once a pool, not a page)
+    const bool sync_blocks = sync_blocks_on();
+    // (wb_learn once a contiguous run of dirty pages, not once a page: the same pages, one lock and one table search a
+    // run; a clean page, a skipped region or block breaks the run)
+    uint64_t note_lo = 0, note_hi = 0;
+    const auto flush_note = [&] {
+        if (note_hi > note_lo) memory_note_cpu_access(note_lo, note_hi - note_lo, true);
+        note_lo = note_hi = 0;
+    };
+    // (consecutive dirty pages almost always come from the same capture: find its buffer when the generation changes,
+    // not once a page; cap_bufs is not touched inside the sync, pools_mu held throughout)
+    uint32_t memo_gen = 0;
+    auto memo_buf = cap_bufs.end();
+    uint64_t last_region = ~0ull;
     for (uint64_t page = p.lo >> kPageShift; page < end_page;) {
-        if (region_gen[page / kRegionPages] <= p.synced_gen) {   // (a clean 2 MB region, or its rest when the pool starts in it)
-            page = std::min(end_page, (page / kRegionPages + 1) * kRegionPages);
+        const uint64_t region = page / kRegionPages;
+        if (gen_table.region_gen(region) <= p.synced_gen) {   // (a clean 2 MB region, or its rest when the pool starts in it)
+            flush_note();
+            page = std::min(end_page, (region + 1) * kRegionPages);
             continue;
         }
+        if (region != last_region) last_region = region, st_sync_dirty_regions++;
+        if (sync_blocks && std::max(gen_table.block_gen(page), gen_table.region_full_gen(region)) <= p.synced_gen) {
+            flush_note();
+            st_sync_blocks_skipped++;
+            page = std::min(end_page, (page / kBlockPages + 1) * kBlockPages);
+            continue;
+        }
+        st_sync_examined++;
         const uint32_t pg = page_gen(page);
         const bool dirty = pg > p.synced_gen;
-        if (dirty && gpu_page(page)) {   // (diagnostic: see memory_stamp_gpu)
+        if (!dirty) {
+            flush_note();
+            page++;
+            continue;
+        }
+        if (note_writes) {
+            if (note_hi == page << kPageShift) note_hi = (page + 1) << kPageShift;
+            else {
+                flush_note();
+                note_lo = page << kPageShift, note_hi = (page + 1) << kPageShift;
+            }
+        }
+        if (gpu_page(page)) {   // (diagnostic: see memory_stamp_gpu)
             st_sync_gpu_pages++;
             const CapEntry e0 = cap_entry(page);
             const bool live = !(e0.gen && e0.gen == pg && cap_bufs.count(e0.gen));
@@ -2702,52 +2703,52 @@ void mirror_sync(Pool& p) {
                      "pool synced at %u, gen now %u)", (unsigned long long)(page << kPageShift), (unsigned long long)p.lo,
                      live ? "live" : "from a capture", pg, (unsigned)p.synced_gen, gen_now);
         }
-        // (hookshot) the CPU wrote this page: in a large binding whose write-back may be left out, the copy below would bring
-        // guest memory's stale rest of the page over the GPU's: that binding is written back from now on (wb_learn.h)
-        if (dirty && note_writes) memory_note_cpu_access(page << kPageShift, 1ull << kPageShift, true);
-        if (dirty && protect_bare_on() && prot_page_since(page, p.synced_gen)) {   // (the GPU's records kept: see prot_pages)
+        if (protect_bare_on() && prot_page_since(page, p.synced_gen)) {   // (the GPU's records kept: see prot_pages)
             st_prot_kept++;
             page++;
             continue;
         }
-        if (dirty && !sync_live()) {   // (as a capture took it, if the page was not written since)
+        if (!sync_live()) {   // (as a capture took it, if the page was not written since)
             const CapEntry e = cap_entry(page);
             if (e.gen && e.gen == pg) {
-                auto b = cap_bufs.find(e.gen);
-                if (b != cap_bufs.end()) {
+                if (e.gen != memo_gen) {
+                    memo_gen = e.gen;
+                    memo_buf = cap_bufs.find(e.gen);
+                    st_sync_cap_lookups++;
+                }
+                if (memo_buf != cap_bufs.end()) {
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
-                    append_capture_copy(cap_runs[b->second.buffer],
+                    append_capture_copy(cap_runs[memo_buf->second.buffer],
                         {(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p.lo, gb - ga});
-                    b->second.last_use = std::max(b->second.last_use, cur_cap_value);
+                    memo_buf->second.last_use = std::max(memo_buf->second.last_use, cur_cap_value);
                     (e.gen == cur_cap_gen ? st_sync_cap_pages : st_sync_old_pages)++;
                     page++;
                     continue;
                 }
             }
         }
-        if (dirty) {
-            st_sync_live_pages++;   // (dirty, not in this submit's capture: guest memory as it is now)
-            live_by_pool[p.lo]++;
-            {   // (RX_VK_LOG_LIVE=1: why, 300 lines: the page's generation, its entry's, the newest capture's)
-                static const bool log_live = env_on("RX_VK_LOG_LIVE");
-                static int logged;
-                if (log_live && logged < 300 && (++live_seen % 97) == 0) {
-                    logged++;
-                    const CapEntry e = cap_entry(page);
-                    logf("vk: live page %#llx: gen %u, entry gen %u (buffer %s), current capture %u, pool synced at %u, gen now %u",
-                         (unsigned long long)(page << kPageShift), pg, e.gen,
-                         e.gen ? (cap_bufs.count(e.gen) ? "kept" : "gone") : "-", cur_cap_gen, (unsigned)p.synced_gen, gen_now);
-                }
+        st_sync_live_pages++;   // (dirty, not in this submit's capture: guest memory as it is now)
+        live_by_pool[p.lo]++;
+        {   // (RX_VK_LOG_LIVE=1: why, 300 lines: the page's generation, its entry's, the newest capture's)
+            static const bool log_live = env_on("RX_VK_LOG_LIVE");
+            static int logged;
+            if (log_live && logged < 300 && (++live_seen % 97) == 0) {
+                logged++;
+                const CapEntry e = cap_entry(page);
+                logf("vk: live page %#llx: gen %u, entry gen %u (buffer %s), current capture %u, pool synced at %u, gen now %u",
+                     (unsigned long long)(page << kPageShift), pg, e.gen,
+                     e.gen ? (cap_bufs.count(e.gen) ? "kept" : "gone") : "-", cur_cap_gen, (unsigned)p.synced_gen, gen_now);
             }
-            const uint64_t a = std::max(page << kPageShift, p.lo) - p.lo, b = std::min((page + 1) << kPageShift, p.hi) - p.lo;
-            if (run_hi == a && run_hi) run_hi = b;
-            else {
-                if (run_hi) runs.push_back({run_lo, run_lo, run_hi - run_lo});
-                run_lo = a, run_hi = b;
-            }
+        }
+        const uint64_t a = std::max(page << kPageShift, p.lo) - p.lo, b = std::min((page + 1) << kPageShift, p.hi) - p.lo;
+        if (run_hi == a && run_hi) run_hi = b;
+        else {
+            if (run_hi) runs.push_back({run_lo, run_lo, run_hi - run_lo});
+            run_lo = a, run_hi = b;
         }
         page++;
     }
+    flush_note();
     if (run_hi) runs.push_back({run_lo, run_lo, run_hi - run_lo});
     for (const auto& [buf, rs] : cap_runs) {
         GprofSpan gp(upload_command_buffer(), "msync copies (CPU pages from a capture -> mirror)");
@@ -3796,7 +3797,7 @@ bool mirror_make(Pool& pool) {
                     parts.push_back({a - r.lo, a - p->lo, b - a});
                 else
                     from_guest = mirror_inherit::runs(a, b, r.lo, p->lo, kPageShift, kRegionPages,
-                                                      [&](uint64_t region) { return region_gen[region] <= synced; },
+                                                      [&](uint64_t region) { return gen_table.region_gen(region) <= synced; },
                                                       [&](uint64_t page) {
                                                           return page_gen(page) <= synced ||
                                                                  (protect_bare_on() && prot_page_since(page, synced));
@@ -4267,13 +4268,18 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
         if (++n % 600 == 0) {
             wb_learn_report();
             if (wb_skips_log()) wb_skips_report();
-            static int64_t l_old;
+            static int64_t l_old, l_examined, l_regions, l_blocks, l_lookups;
             logf("vk: mirror syncs (600 submits): %lld dirty pages from their submits' captures, %lld from earlier ones', "
                  "%lld from guest memory as it was at the replay; %zu captures kept; %lld pages the GPU wrote copied over "
-                 "(%lld live); %lld kept for the GPU (RX_VK_PROTECT_BARE)", (long long)(st_sync_cap_pages - l_cap),
+                 "(%lld live); %lld kept for the GPU (RX_VK_PROTECT_BARE); %lld pages examined in %lld dirty regions "
+                 "(%lld blocks skipped), %lld capture-buffer lookups", (long long)(st_sync_cap_pages - l_cap),
                  (long long)(st_sync_old_pages - l_old), (long long)(st_sync_live_pages - l_live), cap_bufs.size(),
-                 (long long)st_sync_gpu_pages, (long long)st_sync_gpu_live, (long long)st_prot_kept.load());
+                 (long long)st_sync_gpu_pages, (long long)st_sync_gpu_live, (long long)st_prot_kept.load(),
+                 (long long)(st_sync_examined - l_examined), (long long)(st_sync_dirty_regions - l_regions),
+                 (long long)(st_sync_blocks_skipped - l_blocks), (long long)(st_sync_cap_lookups - l_lookups));
             l_cap = st_sync_cap_pages, l_live = st_sync_live_pages, l_old = st_sync_old_pages;
+            l_examined = st_sync_examined, l_regions = st_sync_dirty_regions;
+            l_blocks = st_sync_blocks_skipped, l_lookups = st_sync_cap_lookups;
             if (shadow_bytes || st_wbd_runs)
                 logf("vk: write-back diff (600 submits): %lld runs, %.1f MB compared; %lld pages read into the shadows; %llu MB of shadows; "
                      "pages the shadows knew that the CPU wrote: %lld in captures, %lld only in the collection, %lld only by the replay itself",

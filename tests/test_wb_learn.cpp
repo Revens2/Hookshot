@@ -80,6 +80,15 @@ int main() {
         CHECK(P(t, lo, hi, cap, keep) && keep.size() == 3 && keep[2].first == hi - 0x1000 && keep[2].second == hi);
         CHECK(!t.read(hi - 0x800, hi));   // (known: nothing stale)
     }
+    {   // the CPU's writes noted as one run across two bindings (a mirror sync notes a dirty run): both keep their part
+        Table t;
+        const uint64_t a = 0x1180000000, b = a + 8 * MB, c = b + 8 * MB;
+        for (uint32_t i = 0; i < t.probation; i++) CHECK(!P(t, a, b, cap, keep) && !P(t, b, c, cap, keep));
+        CHECK(P(t, a, b, cap, keep) && keep.empty() && P(t, b, c, cap, keep) && keep.empty());   // (past probation)
+        CHECK(t.read(b - 0x1000, b + 0x1000));   // (one range, two bindings)
+        CHECK(P(t, a, b, cap, keep) && keep.size() == 1 && keep[0].first == b - 0x1000 && keep[0].second == b);
+        CHECK(P(t, b, c, cap, keep) && keep.size() == 1 && keep[0].first == b && keep[0].second == b + 0x1000);
+    }
     {   // a range read before its binding is first written is written back when it is planned
         Table t;
         const uint64_t lo = 0x1163f6e000, hi = lo + 0x7e9000;

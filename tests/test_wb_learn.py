@@ -53,11 +53,13 @@ def check_source():
           "rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));"])
     if "wb_max" in bind:
         raise SystemExit("vk_memory.cpp: the plain size cap is back beside the learned one")
-    # (each dirty page a mirror sync copies is a CPU write the table hears of, before the copy is queued)
+    # (each dirty run of pages a mirror sync copies is a CPU write the table hears of, before the copies are queued)
     sync = block(mem, "void mirror_sync(Pool& p)")
-    note = "if (dirty && note_writes) memory_note_cpu_access(page << kPageShift, 1ull << kPageShift, true);"
+    note = "if (note_hi > note_lo) memory_note_cpu_access(note_lo, note_hi - note_lo, true);"
     need("vk_memory.cpp: mirror_sync()", sync, ["const bool note_writes = memory_wb_followed(p.lo, p.hi);", note])
-    if not sync.index(note) < sync.index("st_sync_live_pages++;"):
+    if "memory_note_cpu_access(page << kPageShift, 1ull << kPageShift, true)" in sync:
+        raise SystemExit("vk_memory.cpp: mirror_sync() reports the CPU's writes once a page again, not once a dirty run")
+    if not sync.rindex("flush_note();") < sync.index("vkCmdCopyBuffer(upload_command_buffer()"):
         raise SystemExit("vk_memory.cpp: mirror_sync() notes the CPU's writes only after it copies them")
     # (the CPU's reads: every invalidate, before its wait for the write-back)
     inv = block(rep, "void invalidate(uint64_t gpu, uint64_t size)")
