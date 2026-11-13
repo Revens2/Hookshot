@@ -91,6 +91,7 @@ struct Pool {
     uint64_t lo = 0, hi = 0;
     enum : uint8_t { MIRROR_NONE, MIRROR_WANTED, MIRROR_ON, MIRROR_REFUSED } mstate = MIRROR_NONE;
     bool inherit_pending = false, trimmed = false;
+    bool splitting = false;   // (RX_VK_IMPORT_LOAD_MB: its parts take its place, trims_settle leaves it alone)
 };
 std::map<uint64_t, Pool> imported;
 std::deque<std::map<uint64_t, Pool>::node_type> retired_pools;

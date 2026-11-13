@@ -92,6 +92,10 @@ struct Pool {
     uint64_t retired_epoch = 0;
     int64_t retired_ms = 0;      // (retired: when, import_now_ms; where its import waits before going back, the wait counts from here)
     bool prefetched = false;     // (amd-fix) imported ahead by the background thread, not bound yet
+    // (RX_VK_IMPORT_LOAD_MB) a load-sized import being split into mirror-chunk imports on the background thread: no mirror of
+    // its own meanwhile (its parts get theirs, at their first binding, as any chunk)
+    bool splitting = false;
+    uint64_t split_id = 0;   // (the split queued for this import: a result for an earlier one over its range is dropped)
     // (hookshot, mirror_trim.h) mostly outside every game pool since this submission (0: not); how often its range was trimmed
     // before; and, retired by a trim, its mirror's contents wanted by each of the pools made from its live parts
     uint64_t dead_since = 0;
@@ -114,6 +118,9 @@ struct GuestPool {
 std::vector<GuestPool> guest_pools;   // by lo, from the host
 std::atomic<uint64_t> guest_pools_gen{1};   // (bumped when that table is replaced: a span cached without the lock goes stale)
 std::map<uint64_t, Pool> imported;    // by lo, made on first use
+// (RX_VK_IMPORT_LOAD_MB) ranges imported at the mirror chunk again: a binding across one looks up at that chunk, as before the
+// split, rather than importing over the parts a load-sized range (which would retire them and split them again)
+std::vector<std::pair<uint64_t, uint64_t>> split_regions;
 Pool* last_pool = nullptr;            // (the last pool_of hit: draws in a row bind buffers of the same pools)
 extern Pool* pool_cache[4096];
 void retire_pool(std::map<uint64_t, Pool>::iterator it);
@@ -2159,8 +2166,25 @@ std::condition_variable bg_cv, bg_done_cv;
 std::deque<std::pair<uint64_t, uint64_t>> bg_queue;
 std::vector<uint64_t> bg_inflight;           // (lo of the ranges queued or being imported)
 std::vector<std::pair<uint64_t, Pool>> bg_ready;
+// (RX_VK_IMPORT_LOAD_MB) A load-sized import is split, once made, into one import per mirror chunk of it a game pool covers.
+// The parts are imported here; the thread that holds pools_mu takes them over (split_drain) and retires the large one.
+struct BgSplit {
+    uint64_t lo = 0, hi = 0, id = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> parts;
+};
+std::deque<BgSplit> split_queue;
+uint64_t split_next_id = 1;
+struct BgSplitDone {
+    BgSplit split;
+    std::vector<Pool> parts;   // (empty when a part failed: the large import stays, in guest memory)
+    bool ok = false;
+};
+std::vector<BgSplitDone> split_ready;
 int64_t st_bg_imports, st_bg_waits, st_prefetch_sent, st_prefetch_used, st_prefetch_dropped;
+int64_t st_split_sent, st_split_done, st_split_parts, st_split_failed;
 void bg_main();
+bool split_import(Pool& p);   // (pools_mu held)
+void split_drain();           // (pools_mu held)
 void bg_start() {   // (bg_mu held)
     static bool started;
     if (!started) {
@@ -2169,15 +2193,50 @@ void bg_start() {   // (bg_mu held)
     }
 }
 
+void free_import(Pool& p) {
+    if (p.buffer) destroy_import_buffer(p.buffer);
+    if (p.memory) vkFreeMemory(dev.device, p.memory, nullptr);
+    for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);
+    p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE, p.pieces.clear();
+}
+
 void bg_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk imports");
     for (;;) {
+        BgSplit split;
         std::pair<uint64_t, uint64_t> r;
+        bool is_split;
         {
             std::unique_lock lk(bg_mu);
-            bg_cv.wait(lk, [] { return !bg_queue.empty(); });
-            r = bg_queue.front();
-            bg_queue.pop_front();
+            bg_cv.wait(lk, [] { return !bg_queue.empty() || !split_queue.empty(); });
+            is_split = bg_queue.empty();
+            if (is_split) {
+                split = std::move(split_queue.front());
+                split_queue.pop_front();
+            } else {
+                r = bg_queue.front();
+                bg_queue.pop_front();
+            }
+        }
+        if (is_split) {
+            BgSplitDone done;
+            done.split = std::move(split);
+            done.ok = true;
+            for (const auto& [a, b] : done.split.parts) {
+                Pool p;
+                if (!import_pool(a, b, p)) {
+                    done.ok = false;
+                    break;
+                }
+                done.parts.push_back(std::move(p));
+            }
+            if (!done.ok) {
+                for (Pool& p : done.parts) free_import(p);
+                done.parts.clear();
+            }
+            std::lock_guard lk(bg_mu);
+            split_ready.push_back(std::move(done));
+            continue;
         }
         Pool p;
         const bool ok = import_pool(r.first, r.second, p);
@@ -2191,6 +2250,7 @@ void bg_main() {
 
 /// The imports the thread made, into the table (pools_mu held); one already there makes the new one redundant
 void bg_drain() {
+    split_drain();
     std::vector<std::pair<uint64_t, Pool>> ready;
     {
         std::lock_guard lk(bg_mu);
@@ -2200,9 +2260,7 @@ void bg_drain() {
     for (auto& [lo, p] : ready) {
         auto imp = imported.find(lo);
         if (imp != imported.end() && imp->second.hi >= p.hi) {
-            destroy_import_buffer(p.buffer);
-            vkFreeMemory(dev.device, p.memory, nullptr);
-            for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);
+            free_import(p);
             continue;
         }
         bool overlap = false;   // (amd-fix: a chunk imported ahead that an import made since covers in part: the pools stay disjoint)
@@ -2218,14 +2276,13 @@ void bg_drain() {
         }
         if (overlap) {
             st_prefetch_dropped++;
-            destroy_import_buffer(p.buffer);
-            vkFreeMemory(dev.device, p.memory, nullptr);
-            for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);
+            free_import(p);
             continue;
         }
         if (imp != imported.end()) retire_pool(imp);
-        imported.emplace(lo, p);
-        guest_pages_set(p.lo, p.hi, p.address);
+        auto ins = imported.emplace(lo, std::move(p)).first;
+        guest_pages_set(ins->second.lo, ins->second.hi, ins->second.address);
+        split_import(ins->second);
     }
 }
 
@@ -2271,20 +2328,137 @@ void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {
 
 /// (imports by chunk (RX_VK_IMPORT_CHUNK_MB), not by pool: each import cost 5-45 ms in the driver, more as their number grew,
 /// and the game makes ~13 pools a second; a chunk covers the pools after it at no cost)
-/// (hookshot) 4 MB, not 16: a pool's VRAM mirror is its import's whole range, and with 16 MB chunks 28-39% of the mirrors'
-/// bytes were outside every game pool (DLAA 2560 x 1440: 459 of 1,666 MB in a Hyrule Field walk, up to 925 MB after Castle
-/// Town to the field). At 4 MB the mirrors were 1,236-1,268 MB against 1,645-1,657 in the same walk, at the same frame rate
-/// (58.1-58.6 against 58.2-59.0 fps); in Kokiri Forest 843 MB against 1,154; with a 6 GB allowance the VRAM peak stayed under
-/// it (5,865-5,887 MB against 6,129-6,135) and the GPU's longest frame was 12.5-13.5 ms against 21.7-24.1 (the frame rate
-/// went either way: 53.0 / 52.4 fps against 50.3 / 54.9). It takes ~50% more imports (91-94 against 59-65 in five minutes,
-/// 0.8 s of driver time in all against 0.7, each one shorter): span_game_pools still takes a pool across a chunk's end into
-/// one import. Only where the pools have mirrors (mirror_on): without them a chunk's padding costs no VRAM, and smaller chunks
-/// would only mean more imports. RX_VK_IMPORT_CHUNK_MB=16: as before
+/// (hookshot) 4 MB, not 16: a pool's VRAM mirror is its import's whole range, so this is also the mirror's granularity (and the
+/// size a load-sized import is split to, split_import): with 16 MB chunks 28-39% of the mirrors' bytes were outside every game
+/// pool (DLAA 2560 x 1440: 459 of 1,666 MB in a Hyrule Field walk, up to 925 MB after Castle Town to the field). At 4 MB the
+/// mirrors were 1,236-1,268 MB against 1,645-1,657 in the same walk, at the same frame rate (58.1-58.6 against 58.2-59.0 fps);
+/// in Kokiri Forest 843 MB against 1,154; with a 6 GB allowance the VRAM peak stayed under it (5,865-5,887 MB against
+/// 6,129-6,135) and the GPU's longest frame was 12.5-13.5 ms against 21.7-24.1 (the frame rate went either way: 53.0 / 52.4 fps
+/// against 50.3 / 54.9). It takes ~50% more imports (91-94 against 59-65 in five minutes, 0.8 s of driver time in all against
+/// 0.7, each one shorter): span_game_pools still takes a pool across a chunk's end into one import. Only where the pools have
+/// mirrors (mirror_on): without them a chunk's padding costs no VRAM, and smaller chunks would only mean more imports.
+/// RX_VK_IMPORT_CHUNK_MB=16: as before
 bool mirror_on();
-uint64_t import_chunk() {
+uint64_t mirror_chunk() {
     static const uint64_t chunk =
         (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB"))) : mirror_on() ? 4 : 16) << 20;
     return chunk;
+}
+/// (hookshot, #3013) The import's granularity: a chunk, unless RX_VK_IMPORT_LOAD_MB=N imports up to N MB at a time (clamped to
+/// the 1 GB no import exceeds), so that a scene's memory is fetched in a few large ranges while it loads. A pool's mirror covers
+/// its import's whole range: a large import is split into mirror_chunk() imports off the replay thread as soon as it is made
+/// (split_import), and its range is then looked up at that chunk again, so the mirrors and the lookups stay the 4 MB ones this
+/// switch leaves alone (the report's 1 GB ranges halved the frame rate through their 1 GB mirrors; split, each part is mirrored
+/// at its first binding as any chunk). 0/unset: off, the import granularity is the mirror's (as before)
+uint64_t import_chunk() {
+    static const uint64_t chunk = [] {
+        const uint64_t mirror = mirror_chunk();
+        const char* e = getenv("RX_VK_IMPORT_LOAD_MB");
+        if (!e) return mirror;
+        const uint64_t load = (uint64_t)std::min(std::max(0, atoi(e)), 1024) << 20;
+        return std::max(mirror, load);
+    }();
+    return chunk;
+}
+/// (RX_VK_IMPORT_LOAD_MB) The parts of [lo, hi): one per mirror chunk a game pool covers, as a lookup in that chunk would have
+/// made its import; the chunks outside every game pool are not imported (pools_mu held)
+std::vector<std::pair<uint64_t, uint64_t>> split_parts(uint64_t lo, uint64_t hi, uint64_t chunk) {
+    std::vector<std::pair<uint64_t, uint64_t>> parts;
+    uint64_t at = lo;
+    for (const GuestPool& g : guest_pools) {
+        if (g.hi <= lo) continue;
+        if (g.lo >= hi) break;
+        uint64_t a = std::max(at, g.lo / chunk * chunk);
+        const uint64_t b = std::min(hi, (g.hi + chunk - 1) / chunk * chunk);
+        for (; a < b; a += chunk) {
+            const uint64_t end = std::min(b, a + chunk);
+            parts.push_back({a, end});
+            at = end;
+        }
+    }
+    return parts;
+}
+/// (RX_VK_IMPORT_LOAD_MB) Whether [lo, hi) is in a range now imported at the mirror chunk (pools_mu held)
+bool in_split_region(uint64_t lo, uint64_t hi) {
+    for (const auto& [a, b] : split_regions)
+        if (lo >= a && hi <= b) return true;
+    return false;
+}
+/// (hookshot, #3013) A load-sized import is left whole for the lookups that find it, and its live chunks are imported on the
+/// background thread, one import each, so that the parts take its place with the mirror chunk's mirrors, off the replay thread.
+/// It stays in guest memory meanwhile (no mirror of its whole range: that is what halved the report's frame rate); the parts
+/// are mirrored at their first binding, as any chunk is. One part failing leaves it whole and unmirrored (split_drain).
+bool split_import(Pool& p) {   // (pools_mu held)
+    if (!mirror_on()) return false;
+    const uint64_t chunk = mirror_chunk(), whole = import_chunk();
+    if (!chunk || whole <= chunk || p.hi - p.lo < whole) return false;
+    std::vector<std::pair<uint64_t, uint64_t>> parts = split_parts(p.lo, p.hi, chunk);
+    if (parts.empty() || (parts.size() == 1 && parts[0].first == p.lo && parts[0].second == p.hi)) return false;
+    p.splitting = true;
+    p.mstate = Pool::MIRROR_REFUSED;   // (in guest memory until its parts are in: never a mirror of the whole range)
+    p.mirror_retry_epoch = 0;
+    p.split_id = split_next_id++;
+    const size_t n = parts.size();
+    {
+        std::lock_guard lk(bg_mu);
+        bg_start();
+        split_queue.push_back({p.lo, p.hi, p.split_id, std::move(parts)});
+    }
+    bg_cv.notify_one();
+    st_split_sent++;
+    static int logged;
+    if (logged++ < 8)
+        logf("vk: pool %#llx..%#llx (%llu MB) imported in a large range: its %zu live chunks imported on the background thread "
+             "(RX_VK_IMPORT_LOAD_MB=%llu)", (unsigned long long)p.lo, (unsigned long long)p.hi,
+             (unsigned long long)((p.hi - p.lo) >> 20), n, (unsigned long long)(whole >> 20));
+    return true;
+}
+/// The part imports the thread made, into the table (pools_mu held): the large pool leaves, one pool per live chunk takes its
+/// place, mirrored at its first binding as any chunk (split_import)
+void split_drain() {
+    std::vector<BgSplitDone> ready;
+    {
+        std::lock_guard lk(bg_mu);
+        if (split_ready.empty()) return;
+        ready.swap(split_ready);
+    }
+    for (BgSplitDone& s : ready) {
+        auto it = imported.find(s.split.lo);
+        const bool current = it != imported.end() && it->second.splitting && it->second.hi == s.split.hi &&
+                             it->second.split_id == s.split.id;
+        if (!current || !s.ok) {
+            if (current) {
+                it->second.splitting = false;   // (a part failed: the large import stays, in guest memory, no whole-range mirror)
+                it->second.mstate = Pool::MIRROR_REFUSED;
+                it->second.mirror_retry_epoch = 0;
+                if (st_split_failed++ < 8)
+                    logf("vk: pool %#llx..%#llx: a split part was not imported, left whole in guest memory",
+                         (unsigned long long)it->second.lo, (unsigned long long)it->second.hi);
+            }
+            for (Pool& p : s.parts) free_import(p);
+            continue;
+        }
+        const bool gpu_only = it->second.gpu_only, gpu_written = it->second.gpu_written;
+        const bool shadow_wanted = it->second.shadow_wanted;
+        retire_pool(it);
+        for (Pool& p : s.parts) {
+            p.gpu_only = gpu_only, p.gpu_written = gpu_written, p.shadow_wanted = shadow_wanted;
+            auto ins = imported.try_emplace(p.lo, std::move(p));   // (an import there would have covered the part: free it)
+            if (!ins.second) {
+                free_import(p);
+                continue;
+            }
+            guest_pages_set(ins.first->second.lo, ins.first->second.hi, ins.first->second.address);
+        }
+        split_regions.push_back({s.split.lo, s.split.hi});
+        st_split_done++, st_split_parts += (int64_t)s.parts.size();
+        static int logged;
+        if (logged++ < 8)
+            logf("vk: pool %#llx..%#llx (%llu MB) split into %zu imports of its live chunks, %lld in all, %lld parts",
+                 (unsigned long long)s.split.lo, (unsigned long long)s.split.hi,
+                 (unsigned long long)((s.split.hi - s.split.lo) >> 20), s.parts.size(), (long long)st_split_done,
+                 (long long)st_split_parts);
+    }
 }
 /// (hookshot) A game pool across a chunk's end had each chunk imported on its own, at the first binding in it, and a later
 /// binding across the end imported the two again as one, on the replay thread: OoT's 16 MB pool at 0x1021745000 bound at
@@ -2323,7 +2497,8 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
     if (it == guest_pools.begin()) return nullptr;
     --it;
     if (guest < it->lo || guest >= it->hi || !size || size > it->hi - guest) return nullptr;
-    const uint64_t chunk = import_chunk();
+    uint64_t chunk = import_chunk();
+    if (chunk > mirror_chunk() && in_split_region(guest, guest + size)) chunk = mirror_chunk();
     const GuestPool range = chunk ? GuestPool{guest, guest + size} : *it;
     auto covering = [&]() {
         auto c = imported.upper_bound(range.lo);
@@ -2432,6 +2607,7 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
         }
         imp = imported.emplace(p.lo, p).first;
         guest_pages_set(p.lo, p.hi, p.address);
+        split_import(imp->second);
         if (chunk) prefetch_chunks(p.lo, p.hi, chunk);
         if (overlapped.size() > 1) {
             static int logged_merge;
@@ -2494,8 +2670,9 @@ bool import_in_background(uint64_t guest, uint64_t size) {
     if (it == guest_pools.begin()) return false;
     --it;
     if (guest < it->lo || guest >= it->hi || size > it->hi - guest) return false;
-    const uint64_t chunk = import_chunk();
+    uint64_t chunk = import_chunk();
     if (!chunk || guest + size > UINT64_MAX - chunk) return false;
+    if (chunk > mirror_chunk() && in_split_region(guest, guest + size)) chunk = mirror_chunk();
     if (auto c = imported.upper_bound(guest); c != imported.begin() && std::prev(c)->second.lo <= guest &&
                                               std::prev(c)->second.hi >= guest + size)
         return false;   // (covered)
@@ -3200,7 +3377,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         Pool* p = tl.p;
         const uint64_t off = guest - p->lo;
         if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
-        if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_WANTED ||
+        if (!mirror_on() || !mirror_upload || p->splitting || p->mstate == Pool::MIRROR_WANTED ||
             (p->mstate == Pool::MIRROR_REFUSED && (!p->mirror_retry_epoch || mirror_epoch < p->mirror_retry_epoch))) {
             note_in_place_read(!mirror_upload);
             return remember({p->buffer, off, size, 0});
@@ -3236,7 +3413,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
             p->mirror_retry_epoch = mirror_epoch + 120;
         }
     }
-    if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
+    if (!mirror_on() || !mirror_upload || p->splitting || p->mstate == Pool::MIRROR_REFUSED) {
         if (written) note_direct_write(*p, off, size);
         if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
         // (hookshot) written by the GPU in guest memory itself, past the mirror (bound outside a recording's uploads): the
@@ -3597,7 +3774,7 @@ bool mirrors_trim() {   // (pools_mu held; true when one was trimmed: its parts 
         const char* v = getenv("RX_VK_MIRROR_TRIM");
         return !v || !env_value_off(v);   // (on unless set off: the switches' one rule, hookshot_env.h)
     }();
-    const uint64_t chunk = import_chunk();
+    const uint64_t chunk = mirror_chunk();   // (the mirror's granularity: trim parts are imports of this size, not of a load range)
     if (!on || !chunk || mirror_epoch % 64 || par_active.load(std::memory_order_relaxed)) return false;
     uint64_t used = 0, allowed = 0;
     const bool pressed = vram_usage(&used, &allowed) && mirror_trim::pressed(used, allowed);
@@ -3682,7 +3859,7 @@ void trims_settle() {
                 Pool& q = it->second;
                 if (q.hi <= r.lo || q.mstate == Pool::MIRROR_ON) continue;
                 all = false;
-                if (q.mstate == Pool::MIRROR_REFUSED && q.hi - q.lo <= (1ull << 30)) q.mstate = Pool::MIRROR_NONE;
+                if (q.mstate == Pool::MIRROR_REFUSED && !q.splitting && q.hi - q.lo <= (1ull << 30)) q.mstate = Pool::MIRROR_NONE;
             }
         }
         if (!all) {
@@ -3753,6 +3930,7 @@ void memory_sync_mirrors_before_segments() {
 /// as they were at their submit (pools_mu held). False over the budget (tried again when next bound, as mirrors are
 /// given back) or over 1 GB (never)
 bool mirror_make(Pool& pool) {
+    if (pool.splitting) return false;   // (RX_VK_IMPORT_LOAD_MB: its parts get the mirrors, not the large import)
     Pool* p = &pool;
     {
         const uint64_t n = p->hi - p->lo;

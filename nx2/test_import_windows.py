@@ -22,7 +22,7 @@ def main():
     source=(ROOT/'gpu/vk/vk_memory.cpp').read_text(encoding='utf-8')
     guard=source[source.index('bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {'):source.index('    p.lo = lo;',source.index('bool import_pool('))]
     lookup=block(source,'Pool* pool_lookup(uint64_t guest, uint64_t size) {')
-    chunking=source[source.index('uint64_t import_chunk() {'):source.index('Pool* pool_lookup(uint64_t guest, uint64_t size) {')]
+    chunking=source[source.index('uint64_t mirror_chunk() {'):source.index('Pool* pool_lookup(uint64_t guest, uint64_t size) {')]
     cache=block(source,'Pool* pool_of(uint64_t guest, uint64_t size) {')
     prefetch=block(source,'void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {')
     fixture='''#include <algorithm>
@@ -36,7 +36,15 @@ def main():
 #include <mutex>
 #include <vector>
 #define CHECK(x) do { if(!(x)){std::fprintf(stderr,"FAIL:%d %s\\n",__LINE__,#x);std::exit(1);} }while(0)
-struct Pool { uint64_t lo=0,hi=0,range_lo=0,range_hi=0,address=0; bool prefetched=false,gpu_only=false,gpu_written=false; uint8_t trims=0; uint64_t trim_epoch=0; };
+struct Pool { uint64_t lo=0,hi=0,range_lo=0,range_hi=0,address=0; bool prefetched=false,gpu_only=false,gpu_written=false; uint8_t trims=0; uint64_t trim_epoch=0; enum : uint8_t { MIRROR_NONE, MIRROR_WANTED, MIRROR_REFUSED, MIRROR_ON } mstate=MIRROR_NONE; bool splitting=false,shadow_wanted=false; uint64_t split_id=0,mirror_retry_epoch=0; };
+struct BgSplit { uint64_t lo=0,hi=0,id=0; std::vector<std::pair<uint64_t,uint64_t>> parts; };
+struct BgSplitDone { BgSplit split; std::vector<Pool> parts; bool ok=false; };
+std::deque<BgSplit> split_queue;
+std::vector<BgSplitDone> split_ready;
+uint64_t split_next_id=1;
+std::vector<std::pair<uint64_t,uint64_t>> split_regions;
+int64_t st_split_sent=0,st_split_done=0,st_split_parts=0,st_split_failed=0;
+void free_import(Pool&) {}
 struct GuestPool { uint64_t lo,hi; };
 std::vector<GuestPool> guest_pools;
 std::map<uint64_t,Pool> imported;

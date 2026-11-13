@@ -1,6 +1,7 @@
-"""Game memory is imported for the GPU in 4 MB chunks by default (gpu/vk/vk_memory.cpp import_chunk; no game/GPU required).
+"""Game memory is imported for the GPU in 4 MB chunks by default (gpu/vk/vk_memory.cpp mirror_chunk; no game/GPU required).
 A pool's VRAM mirror covers its import's whole range: with 16 MB chunks 28-39% of the mirrors' bytes were outside every game
-pool. RX_VK_IMPORT_CHUNK_MB still sets it, and a pool across a chunk's end is still taken into one import (span_game_pools).
+pool. RX_VK_IMPORT_CHUNK_MB still sets it, a pool across a chunk's end is still taken into one import (span_game_pools), and
+RX_VK_IMPORT_LOAD_MB only changes the import's size: import_chunk() takes the mirror chunk unless the load switch asks for more.
 
 python -I -B tests/test_import_chunk_default.py
 """
@@ -21,12 +22,17 @@ def block(text, marker):
 
 def main():
     mem = (ROOT / "gpu/vk/vk_memory.cpp").read_text(encoding="utf-8")
-    chunk = block(mem, "uint64_t import_chunk()")
+    chunk = block(mem, "uint64_t mirror_chunk() {")
     if 'getenv("RX_VK_IMPORT_CHUNK_MB")' not in chunk:
-        raise SystemExit("vk_memory.cpp: import_chunk() no longer reads RX_VK_IMPORT_CHUNK_MB")
+        raise SystemExit("vk_memory.cpp: mirror_chunk() no longer reads RX_VK_IMPORT_CHUNK_MB")
     if ": mirror_on() ? 4 : 16) << 20;" not in chunk:
-        raise SystemExit("vk_memory.cpp: import_chunk()'s default is not 4 MB where the pools have VRAM mirrors and 16 where "
+        raise SystemExit("vk_memory.cpp: mirror_chunk()'s default is not 4 MB where the pools have VRAM mirrors and 16 where "
                          "they have none (16 left 28-39% of the mirrors outside the game's pools; without mirrors 4 only adds imports)")
+    load = block(mem, "uint64_t import_chunk() {")
+    if "mirror_chunk()" not in load:
+        raise SystemExit("vk_memory.cpp: import_chunk() no longer starts from the mirror chunk")
+    if 'getenv("RX_VK_IMPORT_LOAD_MB")' not in load:
+        raise SystemExit("vk_memory.cpp: import_chunk() no longer reads RX_VK_IMPORT_LOAD_MB")
     if "span_game_pools(" not in block(mem, "Pool* pool_lookup(uint64_t guest, uint64_t size) {"):
         raise SystemExit("vk_memory.cpp: pool_lookup() no longer takes a game pool across a chunk's end into one import")
     print("imports by 4 MB chunk by default: ok")
