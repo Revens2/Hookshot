@@ -654,20 +654,35 @@ bool ub_gap_holds(uint64_t addr, uint64_t n, size_t first, size_t lim) {
            ub_gap_cache.first == first && ub_gap_cache.lim == lim && addr >= ub_gap_cache.lo &&
            addr + n >= addr && addr + n <= ub_gap_cache.hi;
 }
+// (the endpoints of the updates [first, lim) the last scan walked: a miss rebuilds them only when the list or the
+// view's bounds changed, not on every queried address)
+struct UbGapArrays {
+    uint64_t epoch = 0;
+    size_t first = 0, lim = 0;
+    std::vector<uint64_t> dst, end;
+    bool on = false;
+};
+thread_local UbGapArrays ub_gap_arrays;
+int64_t st_ub_gap_scans, st_ub_gap_rebuilds;
 bool ub_try_gap(size_t first, size_t lim, uint64_t addr, uint64_t n) {
     if (first > lim) return false;
     const uint64_t epoch = ub_list_epoch.load(std::memory_order_relaxed);
-    static thread_local std::vector<uint64_t> dst, end;
-    dst.clear();
-    end.clear();
-    dst.reserve(lim - first);
-    end.reserve(lim - first);
-    for (size_t i = first; i < lim; i++) {
-        dst.push_back(ub_updates[i].dst);
-        end.push_back(ub_updates[i].dst + ub_updates[i].bytes.size());
+    UbGapArrays& a = ub_gap_arrays;
+    st_ub_gap_scans++;
+    if (!a.on || a.epoch != epoch || a.first != first || a.lim != lim) {
+        st_ub_gap_rebuilds++;
+        a.dst.clear();
+        a.end.clear();
+        if (a.dst.capacity() < lim - first) a.dst.reserve(lim - first);
+        if (a.end.capacity() < lim - first) a.end.reserve(lim - first);
+        for (size_t i = first; i < lim; i++) {
+            a.dst.push_back(ub_updates[i].dst);
+            a.end.push_back(ub_updates[i].dst + ub_updates[i].bytes.size());
+        }
+        a.epoch = epoch, a.first = first, a.lim = lim, a.on = true;
     }
     uint64_t lo = 0, hi = 0;
-    if (!ub_gap(dst.data(), end.data(), (int)dst.size(), addr, n, &lo, &hi)) return false;
+    if (!ub_gap(a.dst.data(), a.end.data(), (int)a.dst.size(), addr, n, &lo, &hi)) return false;
     if (ub_list_epoch.load(std::memory_order_relaxed) != epoch) return false;   // (the list changed: do not keep the gap)
     ub_gap_cache = {epoch, lo, hi, first, lim, true};
     return true;
@@ -3150,14 +3165,15 @@ void log_frame_stats() {
              (long long)mirrors, (unsigned long long)mirror_mb, (sync_b - l_sync_b) / 120.0 / 1048576.0,
              (sync_c - l_sync_c) / 120.0, (wb_b - l_wb_b) / 120.0 / 1048576.0);
         l_sync_b = sync_b, l_sync_c = sync_c, l_wb_b = wb_b;
-        static int64_t l_d, l_sk, l_di, l_pass, l_sub, l_up, l_upb, l_bar, l_ubu, l_ubo, l_wait;
+        static int64_t l_d, l_sk, l_di, l_pass, l_sub, l_up, l_upb, l_bar, l_ubu, l_ubo, l_wait, l_ugs, l_ugr;
         logf("vk: %lld presents, %.1f fps; a frame: %.0f draws (%.0f skipped), %.0f dispatches, %.0f passes, %.0f "
-             "barriers, %.0f submits, %.1f uploads (%.1f MB), %.0f ub updates (%.0f overlays), GPU-bound wait %.1f ms; "
-             "%lld pipelines (%.0f ms), %lld programs (%lld failed), %zu textures (%llu MB)",
+             "barriers, %.0f submits, %.1f uploads (%.1f MB), %.0f ub updates (%.0f overlays, %.0f gap scans, %.0f endpoint "
+             "rebuilds), GPU-bound wait %.1f ms; %lld pipelines (%.0f ms), %lld programs (%lld failed), %zu textures (%llu MB)",
              (long long)presents, 120.0 / secs, (d - l_d) / 120.0, (sk - l_sk) / 120.0, (di - l_di) / 120.0,
              (passes - l_pass) / 120.0, (st_barriers - l_bar) / 120.0, (st_submits - l_sub) / 120.0,
              (up - l_up) / 120.0, (upb - l_upb) / 120.0 / 1048576.0, (st_ub_updates - l_ubu) / 120.0,
-             (st_ub_overlays - l_ubo) / 120.0, (st_wait_ns - l_wait) / 120.0 / 1e6, (long long)pl, pms,
+             (st_ub_overlays - l_ubo) / 120.0, (st_ub_gap_scans - l_ugs) / 120.0, (st_ub_gap_rebuilds - l_ugr) / 120.0,
+             (st_wait_ns - l_wait) / 120.0 / 1e6, (long long)pl, pms,
              (long long)tr, (long long)fl, texture_count(), (unsigned long long)(texture_bytes() >> 20));
         draw_skip_report(120.0);
         {   // (hookshot: the full barriers recorded and the ones left out as the second of two in a row, RX_VK_BARRIER_DEDUPE_OFF=1)
@@ -3205,6 +3221,7 @@ void log_frame_stats() {
         gprof_report(120);
         l_d = d, l_sk = sk, l_di = di, l_pass = passes, l_sub = st_submits, l_up = up, l_upb = upb, l_bar = st_barriers;
         l_ubu = st_ub_updates, l_ubo = st_ub_overlays, l_wait = st_wait_ns;
+        l_ugs = st_ub_gap_scans, l_ugr = st_ub_gap_rebuilds;
         fps_t = now, fps_n = 0;
     }
 }

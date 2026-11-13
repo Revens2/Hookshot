@@ -4323,6 +4323,7 @@ bool dyn_same(const float* fp, int nf, const uint32_t* up, int nu, const uint8_t
     return true;
 }
 constexpr int kDynF = 13, kDynU = 35;
+constexpr int kDynNb = (int)(sizeof(NvnState::ds) + sizeof(NvnState::blend) + 8);
 struct DynFast {
     bool on = false;
     float fp[kDynF]{};
@@ -4363,13 +4364,58 @@ int dyn_pack(const NvnState& s, const Targets& at, VkPrimitiveTopology topo, boo
     return atb + 8;
 }
 
+/// (hookshot) Whether dyn_pack would write what the last full draw's arrays hold, read from the state itself: the fast
+/// path then skips the pack and its compare. Most draws repeat the draw before them, and this runs per draw. Every field
+/// dyn_pack reads is checked here against the slot it packs into, so a hit means the packed arrays would be bit-identical
+/// (floats compared like dyn_same compares them: -0.0 equals 0.0, as before).
+bool dyn_src_same(const NvnState& s, const Targets& at, VkPrimitiveTopology topo, bool mesh) {
+    const float* fp = dyn_fast.fp;
+    const uint32_t* up = dyn_fast.up;
+    const uint8_t* raw = dyn_fast.raw;
+    if (s.viewport[0][0] != fp[0] || s.viewport[0][1] != fp[1] || s.viewport[0][2] != fp[2] || s.viewport[0][3] != fp[3])
+        return false;
+    if (s.depth_near != fp[4] || s.depth_far != fp[5]) return false;
+    if (std::memcmp(s.blend_color, fp + 6, sizeof s.blend_color)) return false;
+    if (s.poly_offset[0] != fp[10] || s.poly_offset[1] != fp[11] || s.poly_offset[2] != fp[12]) return false;
+    if ((uint32_t)s.scissor[0] != up[0] || (uint32_t)s.scissor[1] != up[1] || (uint32_t)s.scissor[2] != up[2] ||
+        (uint32_t)s.scissor[3] != up[3])
+        return false;
+    if (s.stencil_ref[0] != up[4] || s.stencil_ref[1] != up[5]) return false;
+    if (s.stencil_value_mask[0] != up[6] || s.stencil_value_mask[1] != up[7]) return false;
+    if (s.stencil_mask[0] != up[8] || s.stencil_mask[1] != up[9]) return false;
+    if (at.width != up[10] || at.height != up[11] || (uint32_t)at.n != up[12] || (uint32_t)at.depth_format != up[13]) return false;
+    if ((at.depth != nullptr) != (up[14] != 0)) return false;
+    if ((uint32_t)s.color.blend_en != up[15] || s.chmask.mask != up[16]) return false;
+    if ((uint32_t)topo != up[17] || (mesh ? 1u : 0u) != up[18]) return false;
+    if ((s.restart ? 1u : 0u) != up[19] || (s.raster_discard ? 1u : 0u) != up[20] || (s.depth_clamp ? 1u : 0u) != up[21] ||
+        (s.ms.a2c ? 1u : 0u) != up[22])
+        return false;
+    if ((uint32_t)s.poly.cull != up[23] || (uint32_t)s.poly.front != up[24] || (uint32_t)s.poly.mode != up[25] ||
+        (uint32_t)s.poly.offset_en != up[26])
+        return false;
+    for (int i = 0; i < 8; i++)
+        if ((uint32_t)at.color_format[i] != up[27 + i]) return false;
+    if (std::memcmp(&s.ds, raw, sizeof s.ds)) return false;
+    if (std::memcmp(s.blend, raw + sizeof s.ds, sizeof s.blend)) return false;
+    static const bool by_program = env_on("RX_VK_DYN_PROG_KEY");
+    const uint64_t prog = by_program || !cur_program ? (uint64_t)(uintptr_t)cur_program : program_wm_sig(*cur_program);
+    return std::memcmp(&prog, raw + sizeof s.ds + sizeof s.blend, 8) == 0;
+}
+
 void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, bool mesh) {
+    // (the common case, an unchanged draw, is decided from the state itself: no pack, no compare of the packed copy)
+    if (!dump_on() && last_dyn_valid && dyn_fast.on && dyn_fast.nb == kDynNb && dyn_src_same(s, at, topo, mesh)) {
+        pass().wm_or |= dyn_fast.wm0, pass().wm_n = dyn_fast.wm_n;   // (the pass trace still sees the masks)
+        FINE_N(FC_DYN_FAST, 1);
+        return;
+    }
     float df[kDynF];
     uint32_t du[kDynU];
     uint8_t db[160];
     const int nb = dyn_pack(s, at, topo, mesh, df, du, db);
     if (!dump_on() && last_dyn_valid && dyn_fast.on && dyn_fast.nb == nb &&
         dyn_same(df, kDynF, du, kDynU, db, nb, dyn_fast.fp, dyn_fast.up, dyn_fast.raw)) {
+        // (a source that compared unequal but packs to the arrays kept: the pack's key is what the state is remembered by)
         pass().wm_or |= dyn_fast.wm0, pass().wm_n = dyn_fast.wm_n;   // (the pass trace still sees the masks)
         FINE_N(FC_DYN_FAST, 1);
         return;
