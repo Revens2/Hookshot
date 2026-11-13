@@ -13,6 +13,7 @@
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
 #include "compat/hookshot_env.h"
 #endif
+#include "draw_tally.h"
 #include "vk_vendor.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -189,7 +190,7 @@ void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind);
 /// what they share (textures and their uploads, programs, pipelines, samplers, pools and memory stamps) is used under
 /// one lock; the per-draw caches are each thread's own
 extern std::atomic<bool> par_active;
-extern std::atomic<int64_t> par_lock_wait_ns, par_locks;   // (contention: the time threads waited for it)
+// (the contention's counts and the time threads waited for it: draw_tally.h, shared: ParLock is taken outside the replay threads too)
 std::recursive_mutex& par_mutex();
 int64_t par_now_ns();
 struct ParLock {

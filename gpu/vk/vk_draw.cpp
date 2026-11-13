@@ -55,6 +55,7 @@
 #include "driver_faults.h"
 #include "fallback_size_policy.h"
 #include "translate_wait.h"
+#include "checkpoint_blocks.h"
 
 #include "shaders/clear_f_frag_spv.h"
 #include "shaders/clear_i_frag_spv.h"
@@ -1095,7 +1096,7 @@ std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> pipelines;   // (the re
 std::mutex kept_ready_mu;
 std::unordered_map<uint64_t, VkPipeline> kept_ready;
 std::atomic<size_t> kept_ready_n{0};
-int64_t st_draws, st_skipped, st_dispatches, st_passes, st_mesh, st_pending_skips, st_waits;
+// (the draw and dispatch counters: draw_tally.h, a recording thread's own line by default, totals for the logs)
 int64_t st_dispatch_unordered;   // (hookshot: dispatches right after another left without a barrier, RX_VK_GAME_ORDER)
 // (hookshot) skips by the line that made them, reported with the frame statistics (draw_skip_report)
 namespace {
@@ -1110,7 +1111,7 @@ int skip_slot(int line) {
     return 47;
 }
 }  // namespace
-#define SKIP_HERE() do { static const int slot_ = skip_slot(__LINE__); skip_sites[slot_].n.fetch_add(1, std::memory_order_relaxed); st_skipped++; return; } while (0)
+#define SKIP_HERE() do { static const int slot_ = skip_slot(__LINE__); skip_sites[slot_].n.fetch_add(1, std::memory_order_relaxed); tally_bump(&DrawTally::skipped, st_skipped); return; } while (0)
 void skip_report_impl(double frames) {
     char line[600];
     int n = snprintf(line, sizeof line, "vk: skips a frame by vk_draw.cpp line:");
@@ -3214,7 +3215,7 @@ bool dump_sampled_wanted(uint64_t key) {
     return std::find(want.begin(), want.end(), key) != want.end();
 }   // (RX_VK_DUMP: the storage images the descriptors let the program write)
 TLS_OBJECT(dump_inputs, std::string)               // (and what it samples)
-int64_t st_dummy_textures;               // (textures sampled as the dummy: no image for the handle)
+// (textures sampled as the dummy: no image for the handle; draw_tally.h)
 
 void dump_input(char kind, uint32_t index, uint32_t handle, const Texture* tex) {
     char b[160];
@@ -3745,7 +3746,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
                                (void*)view, view ? "" : " (dummy)");
                 if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
-                if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
+                if (!view) view = dummies.view[(int)vt], tally_bump(&DrawTally::dummy_textures, st_dummy_textures, handle != 0);
                 dw().imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw().imgs[first];
@@ -3984,8 +3985,11 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
 // ---- RX_VK_CHECKPOINTS: a marker before each draw and dispatch (VK_NV_device_diagnostic_checkpoints); when the
 // device is lost, the markers the GPU reached say which program it was running ----
 struct Checkpoint { uint64_t prog; uint64_t frame; uint32_t seq; char kind; };
-Checkpoint checkpoints[1 << 16];
+alignas(64) Checkpoint checkpoints[1 << 16];   // (a tick's left over numbers are a thread's own 24 lines, checkpoint_blocks.h)
 std::atomic<uint32_t> checkpoint_n{0};
+// (this thread's block of marker numbers: checkpoint_blocks.h. A block is 24 lines of its own, so the five recording
+// threads write their own entries instead of taking the lines next to each other's)
+thread_local uint32_t cp_next = 0, cp_end = 0;
 
 // (VK_AMD_buffer_marker, where the NV checkpoints are missing: marker i's sequence number goes to word 2i when the GPU
 // reaches it and to word 2i + 1 once all the work before it is done. Host memory, not VRAM: a GPU reset loses VRAM.)
@@ -4010,7 +4014,7 @@ void set_checkpoint(VkCommandBuffer cmd, uint32_t i, uint32_t seq) {
 }
 void checkpoint(VkCommandBuffer cmd, const Program& p, char kind) {
     if (!checkpoints_on()) return;
-    const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
+    const uint32_t seq = checkpoint_blocks::next(cp_next, cp_end, checkpoint_n), i = (seq - 1) & 0xFFFF;
     checkpoints[i] = {p.key, texture_frame_no(), seq, kind};
     set_checkpoint(cmd, i, seq);
 }
@@ -4088,7 +4092,7 @@ void device_fault_report() {
 
 void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind) {
     if (!checkpoints_on()) return;
-    const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
+    const uint32_t seq = checkpoint_blocks::next(cp_next, cp_end, checkpoint_n), i = (seq - 1) & 0xFFFF;
     checkpoints[i] = {key, texture_frame_no(), seq, kind};
     set_checkpoint(cmd, i, seq);
 }
@@ -4135,6 +4139,9 @@ void buffer_markers_init() {
 
 namespace {
 // (the markers the GPU reached whose earlier work never finished: the hang is in the work after the last marker that did)
+// A thread's numbers count up as it records, but the threads reserve from one counter: marker numbers are approximately,
+// not exactly, the order the GPU saw the work (segments are recorded at once and submitted in order). The last finished
+// number is the replay's estimate of where the GPU got to; each entry printed is checked against its number (line below).
 void buffer_markers_report() {
     const uint32_t n = checkpoint_n.load(), first = n > 0xFFFF ? n - 0xFFFF : 1;
     uint32_t reached = 0, last_done = 0;
@@ -4146,9 +4153,16 @@ void buffer_markers_report() {
         if (d) last_done = s;
         else if (r) stuck.push_back(s);
     }
-    logf("vk: device lost: %u markers set, %u reached; the last whose earlier work all finished: %u", n, reached, last_done);
+    // (blocks of 64 numbers are reserved by each recording thread: more are reserved than markers were set, by less than
+    // a block for each thread; the ones never set match no marker word and are skipped)
+    logf("vk: device lost: %u markers reserved, %u reached; the last whose earlier work all finished: %u", n, reached, last_done);
     const auto line = [](const char* what, uint32_t s) {
         const Checkpoint& k = checkpoints[(s - 1) & 0xFFFF];
+        // (a slot reused since: what it holds is a newer marker's entry, not this one's, so it is not printed as this one's)
+        if (k.seq != s) {
+            logf("vk:   %s: marker %u (its entry was reused by marker %u)", what, s, k.seq);
+            return;
+        }
         logf("vk:   %s: marker %u (%s %016llx, frame %llu)", what, s, checkpoint_kind(k.kind), (unsigned long long)k.prog,
              (unsigned long long)k.frame);
     };
@@ -4191,13 +4205,19 @@ void checkpoints_report() {
     vkGetQueueCheckpointDataNV(dev.queue, &n, nullptr);
     std::vector<VkCheckpointDataNV> cps(n, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
     vkGetQueueCheckpointDataNV(dev.queue, &n, cps.data());
-    logf("vk: device lost: %u checkpoints (%u markers set)", n, checkpoint_n.load());
+    logf("vk: device lost: %u checkpoints (%u markers reserved)", n, checkpoint_n.load());
     watched();
     for (const VkCheckpointDataNV& c : cps) {
         const uint32_t i = (uint32_t)(uintptr_t)c.pCheckpointMarker - 1;
         if (i >= (1u << 16)) continue;
         const Checkpoint& k = checkpoints[i];
         const auto kind = checkpoint_kind;
+        // (the ring's window: an entry older than it names a marker whose slot has since been rewritten)
+        const uint32_t kept = checkpoint_n.load();
+        if (k.seq < (kept > 0xFFFF ? kept - 0xFFFF : 1)) {
+            logf("vk:   stage %#x: marker %u (no entry: older than the ring)", (unsigned)c.stage, i + 1);
+            continue;
+        }
         logf("vk:   stage %#x: marker %u (%s %016llx, frame %llu)", (unsigned)c.stage, k.seq, kind(k.kind),
              (unsigned long long)k.prog, (unsigned long long)k.frame);
         // (the ones before it, for context)
@@ -4282,7 +4302,7 @@ struct IndexBind {
     bool on = false;
 };
 thread_local IndexBind last_ib;
-int64_t st_desc_reused;
+// (descriptor sets kept from the neighbour draw: draw_tally.h)
 
 thread_local uint64_t targets_serial = ~0ull;   // (the state's render targets resolved once per NOP_SET_RT)
 thread_local Targets cached_targets;
@@ -4422,7 +4442,7 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     pass().sampled.clear(), pass().sampled_targets = 0, pass().written = 0;
     vkCmdBeginRendering(cmd, &ri);
     pass().open = true;
-    st_passes++;
+    tally_bump(&DrawTally::passes, st_passes);
 }
 
 /// The dynamic state a draw sets, compared with what the command buffer has (only what changed is set again: most
@@ -6446,7 +6466,7 @@ bool fallback_pipelines_ready(Program& p) {
     if (p.compute_state.load(std::memory_order_acquire) != 2) {
         static std::atomic<int> told{0};
         if (told++ < 40) logf("vk: fallback draw of %016llx left out: its compute pipelines are still compiling", (unsigned long long)p.key);
-        st_pending_skips++;
+        tally_bump(&DrawTally::pending_skips, st_pending_skips);
         return false;
     }
     return !p.fallback_compute.empty();
@@ -6937,7 +6957,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         PROF_EXACT();
         const auto t0 = std::chrono::steady_clock::now();
         jobs_wait(ready);
-        st_waits++;
+        tally_bump(&DrawTally::waits, st_waits);
         st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
     // (hookshot) RX_VK_TRANSLATE_WAIT_MS=<ms> (off unless set): a translation not ready, for a draw whose targets hold an
@@ -6962,7 +6982,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         return ms;
     }();
     if (!cp->ready.load(std::memory_order_acquire)) {
-        if (legacy_translation_skip && targets_persistent(at)) return use.skipped(), void(st_pending_skips++);
+        if (legacy_translation_skip && targets_persistent(at)) return use.skipped(), void(tally_bump(&DrawTally::pending_skips, st_pending_skips));
         if (!always_wait && translate_wait_ms >= 0 && targets_persistent(at)) {
             static thread_local uint64_t budget_frame = ~0ull;
             static thread_local double budget_left = 0;
@@ -6975,12 +6995,12 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 ready = jobs_wait_for(cp->ready, budget_left);
                 const double took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 budget_left -= took;
-                st_waits++;
+                tally_bump(&DrawTally::waits, st_waits);
                 st_wait_ms += took;
             } else {
                 ready = cp->ready.load(std::memory_order_acquire);
             }
-            if (!ready) return use.skipped(), void(st_pending_skips++);
+            if (!ready) return use.skipped(), void(tally_bump(&DrawTally::pending_skips, st_pending_skips));
         } else {
             wait_for(cp->ready);
         }
@@ -7016,7 +7036,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
         const bool may_skip = !always_wait && targets_persistent(at) && !writes_memory(p);
-        if (may_skip) return use.skipped(), void(st_pending_skips++);
+        if (may_skip) return use.skipped(), void(tally_bump(&DrawTally::pending_skips, st_pending_skips));
         wait_for(pe->ready);
     }
     if (use.on) use.pipeline_made(pe->how.load(std::memory_order_relaxed));
@@ -7238,7 +7258,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             last_desc_fp() = desc_fp(), last_desc_fp_dummy = desc_fp_dummy, last_desc_samp = desc_samp_seen,
             last_desc_destroy = desc_destroy_seen;
     } else {
-        st_desc_reused++;
+        tally_bump(&DrawTally::desc_reused, st_desc_reused);
     }
     {
         FINE_SCOPE(FT_PUSHC);
@@ -7319,8 +7339,8 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (d.mesh) {
         if (p.fallback) {   // (hookshot: the generated vertex stage reads the records; one vertex a corner)
             vkCmdDrawIndirect(cmd, fallback_draw_records, 0, 1, sizeof(VkDrawIndirectCommand));   // (its count: the records taken)
-            st_mesh++;
-            st_draws++, pass().draws++;
+            tally_bump(&DrawTally::mesh, st_mesh);
+            tally_bump(&DrawTally::draws, st_draws), pass().draws++;
             return;
         }
         {   // (amd-fix, diagnosis) RX_VK_LOG_MESH_PROGS=1: each mesh program's first draw and every 600th, with what its
@@ -7384,8 +7404,8 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 else
                     vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_conv_buf, mesh_conv_off, conv_n, 12);
                 mesh_conv_buf = VK_NULL_HANDLE;
-                st_mesh++;
-                st_draws++, pass().draws++;
+                tally_bump(&DrawTally::mesh, st_mesh);
+                tally_bump(&DrawTally::draws, st_draws), pass().draws++;
                 return;
             }
             if (d.max < 0 || d.stride < 0) SKIP_HERE();   // (hookshot: the game's ints; a negative count was ~4e9 draws)
@@ -7415,8 +7435,8 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             vkCmdDrawMeshTasksEXT(cmd, (uint32_t)std::max(d.groups[0], 0), (uint32_t)std::max(d.groups[1], 1),
                                   (uint32_t)std::max(d.groups[2], 1));
         }
-        st_mesh++;
-        st_draws++, pass().draws++;
+        tally_bump(&DrawTally::mesh, st_mesh);
+        tally_bump(&DrawTally::draws, st_draws), pass().draws++;
         return;
     }
     // vertex streams (from their pools, strides dynamic) and the zero stream
@@ -7506,7 +7526,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         bind_index(cmd, cur->stream, at6, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, quads * 6, (uint32_t)std::max(1, d.instances), 0, d.indexed ? d.base_vertex : 0,
                          (uint32_t)d.base_instance);
-        st_draws++, pass().draws++;
+        tally_bump(&DrawTally::draws, st_draws), pass().draws++;
         return;
     }
     if (d.indirect) {
@@ -7543,7 +7563,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_DRAWCALL);
         vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);
     }
-    st_draws++, pass().draws++;
+    tally_bump(&DrawTally::draws, st_draws), pass().draws++;
 }
 
 /// A dispatch over 2 ms is logged, 60 times, and only while RX_VK_SLOW_DISPATCH is set. Off, the clock is not read.
@@ -9228,7 +9248,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     if (cp && !cp->ready.load(std::memory_order_acquire)) {
         const auto t0 = std::chrono::steady_clock::now();
         jobs_wait(cp->ready);
-        st_waits++;
+        tally_bump(&DrawTally::waits, st_waits);
         st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
     if (!cp || cp->failed) {   // (hookshot) the program's resources, once a control section: what a rejected dispatch reads/writes
@@ -9280,7 +9300,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                                   cp->stages[0].info.uses_cooperative_matrix, gameplay_network(cp->key)) ||
                                (force_stub && cp->stages[0].info.uses_cooperative_matrix &&
                                 (force_stub >= 2 || !gameplay_network(cp->key))));
-    if ((!cp || cp->failed || slow_network) && upscale_stub(cmd, s, compute_code_key(s))) return void(st_dispatches++);
+    if ((!cp || cp->failed || slow_network) && upscale_stub(cmd, s, compute_code_key(s))) return void(tally_bump(&DrawTally::dispatches, st_dispatches));
     if (slow_network) SKIP_HERE();   // (an earlier pass of the network: the stub is its last pass)
     if (!cp || !cp->ready.load(std::memory_order_acquire) || cp->failed) SKIP_HERE();
     {   // (hookshot, RX_VK_SKIP_PROG=<key prefix,...>: those programs' dispatches left out, for diagnosis)
@@ -9384,7 +9404,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         if (p.compute_state.load(std::memory_order_acquire) != 2) {
             static std::atomic<int> told{0};
             if (told++ < 40) logf("vk: dispatch of %016llx left out: its compute pipeline is still compiling", (unsigned long long)p.key);
-            st_pending_skips++;
+            tally_bump(&DrawTally::pending_skips, st_pending_skips);
             use.skipped();
             return;
         }
@@ -9475,9 +9495,9 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             logf("%s", line);
         }
     }
-    if (fsr3_stand_in(cmd, s, p)) return void(st_dispatches++);
-    if (temporal_stand_in(cmd, s, p)) return void(st_dispatches++);
-    if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
+    if (fsr3_stand_in(cmd, s, p)) return void(tally_bump(&DrawTally::dispatches, st_dispatches));
+    if (temporal_stand_in(cmd, s, p)) return void(tally_bump(&DrawTally::dispatches, st_dispatches));
+    if (taau_stand_in(cmd, s, p)) return void(tally_bump(&DrawTally::dispatches, st_dispatches));
     if (!p.compute_pipeline) SKIP_HERE();
     dump_ssbos(cmd, p, "before");
     if (!p.dispatched.load(std::memory_order_relaxed)) compute_variant_note(p.key, p.variant);   // (which variant: this install's own)
@@ -9564,7 +9584,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         snprintf(label, sizeof label, "dispatch %s prog %016llx", indirect ? "indirect" : "", (unsigned long long)p.key);
         gprof_end(cmd, label);
     }
-    st_dispatches++;
+    tally_bump(&DrawTally::dispatches, st_dispatches);
     if (pass_trace_on())
         trace_line("dispatch %ux%ux%u%s prog %016llx", x, y, z, indirect ? " indirect" : "", (unsigned long long)p.key);
     if (probe_on())
@@ -9626,12 +9646,15 @@ void dry_mark_written(NvnState& s, bool compute, bool first) {
 }
 
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipes) {
+    tally_fold();   // (this thread's counts since its last fold: the replay thread's are not in the totals yet)
     *draws = st_draws, *skipped = st_skipped, *dispatches = st_dispatches, *pipes = st_pipelines.load();
 }
 void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms) {
+    tally_fold();
     *passes = st_passes, *mesh = st_mesh, *pipeline_ms = st_pipeline_us.load() / 1000.0;
 }
 void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms) {
+    tally_fold();
     *pending_skips = st_pending_skips, *waits = st_waits, *wait_ms = st_wait_ms;
 }
 bool draw_stats4(int64_t* links, double* link_ms, int64_t* lib_hits, int64_t* lib_cold, int64_t* lib_built, double* lib_build_ms) {
@@ -9727,7 +9750,8 @@ void draw_records_log(uint64_t lo, uint64_t hi) {
     }
 }
 int64_t draw_desc_reused() {
-    return st_desc_reused;
+    tally_fold();
+    return st_desc_reused.load(std::memory_order_relaxed);
 }
 int64_t draw_slotgen_saves() {   // (Descriptor reuse: of those, what the global registrations' generation check would have rebuilt)
     return st_desc_slotgen_saves;

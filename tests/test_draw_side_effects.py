@@ -59,6 +59,10 @@ struct { long long pipes_new = 0; } use_counters;
 struct Targets { bool persistent = true; };
 struct NvnState {};
 struct ParLock {};
+// (the draw tally, gpu/vk/draw_tally.h: the block counts waits and skips through it; the scenarios read the totals, so the
+// bump goes straight to the stand-in's own counter)
+struct DrawTally { int waits, pending_skips; };
+template <class Member, class Counter> void tally_bump(Member, Counter& c, int n = 1) { c += n; }
 struct DrawArgs { bool indirect = true; int groups[3]{1, 1, 1}; int first_task = 0; };
 int fallback_task_groups(const Program&) { std::abort(); }
 void draw(int, NvnState&, const DrawArgs&) { std::abort(); }

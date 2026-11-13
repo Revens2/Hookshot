@@ -510,10 +510,11 @@ T payload(const uint8_t* a, uint32_t bytes) {
     return v;
 }
 
-int64_t st_barriers, st_ub_updates, st_ub_overlays, st_submits;
+int64_t st_submits;
+// (st_barriers, st_ub_updates, st_ub_overlays: draw_tally.h, a recording thread's own line by default)
 /* (hookshot) what makes a draw rebuild its descriptors: which NVN binding moved the state's generation. A draw's
    descriptor set is rebuilt when bind_gen moved, and 0.9 of the draws rebuilt theirs (3.2 ms a frame). */
-int64_t st_bg_prog, st_bg_bufs, st_bg_ubo, st_bg_ssbo, st_bg_tex, st_bg_samp, st_bg_img;
+// (st_bg_prog, st_bg_bufs and the per-kind bind counts: draw_tally.h)
 std::map<int32_t, int64_t> st_barrier_flags;   // (the game's nvnCommandBufferBarrier bits: how many of each combination, the frame log)
 std::mutex st_barrier_flags_mu;   // (a parallel replay's threads count their barriers too)
 // ---- events in replay order: the values the stream's signals and the CPU's set, for the GPU's waits on them. The
@@ -754,7 +755,7 @@ uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::functio
         const uint64_t lo = std::max(addr, u.dst), hi = std::min(addr + n, u.dst + u.bytes.size());
         if (lo < hi) std::memcpy(p + (lo - addr), u.bytes.data() + (lo - u.dst), hi - lo);
     }
-    st_ub_overlays++;
+    tally_bump(&DrawTally::ub_overlays, st_ub_overlays);
     ub_copy_keep(addr, n, base, first, lim, at, view, epoch);
     return at;
 }
@@ -1043,7 +1044,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 ub_updates.push_back(std::move(up));
                 ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
                 ub_gen++;
-                st_ub_updates++;
+                tally_bump(&DrawTally::ub_updates, st_ub_updates);
             }
             break;
         }
@@ -1068,7 +1069,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             const auto b = payload<nvn_p_bind_program>(a, avail);
             // (the same program bound again: its descriptors already stand)
             const bool same = b.prog && s.has_prog ? std::memcmp(&s.prog, b.prog, sizeof s.prog) == 0 : !b.prog && !s.has_prog;
-            if (!same) s.bind_gen++, st_bg_prog++;
+            if (!same) s.bind_gen++, tally_bump(&DrawTally::bg_prog, st_bg_prog);
             if (b.prog) s.prog = *b.prog;
             s.has_prog = b.prog != nullptr && b.prog->nstage > 0;
             break;
@@ -1146,7 +1147,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 }
                 nvn_p_bind_buf& u = (b.ssbo ? s.ssbo : s.ubo)[b.stage][index];
                 if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, index, b.r[i].address, b.r[i].size)) {
-                    s.bind_gen++, st_bg_bufs++;
+                    s.bind_gen++, tally_bump(&DrawTally::bg_bufs, st_bg_bufs);
                     if (b.ssbo) s.ssbo_gen[b.stage] = s.bind_gen;
                 }
                 u.stage = b.stage, u.index = index, u.addr = b.r[i].address, u.size = b.r[i].size;
@@ -1167,7 +1168,8 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 nvn_p_bind_buf& u = (h.op == NOP_BIND_UBO ? s.ubo : s.ssbo)[b.stage][b.index];
                 if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, b.index, b.addr, b.size)) {
                     s.bind_gen++;
-                    (h.op == NOP_BIND_UBO ? st_bg_ubo : st_bg_ssbo)++;
+                    if (h.op == NOP_BIND_UBO) tally_bump(&DrawTally::bg_ubo, st_bg_ubo);
+                    else tally_bump(&DrawTally::bg_ssbo, st_bg_ssbo);
                     if (h.op == NOP_BIND_SSBO) s.ssbo_gen[b.stage] = s.bind_gen;
                 }
                 u = b;
@@ -1191,7 +1193,9 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             while (n < b.n && b.first + n < lim) n++;
             if (!handles_unchanged(to + b.first, b.h, n)) {   // (the same handles: the draw keeps its descriptors)
                 s.bind_gen++;
-                (h.op == NOP_BIND_TEX ? st_bg_tex : h.op == NOP_BIND_SAMP ? st_bg_samp : st_bg_img)++;
+                if (h.op == NOP_BIND_TEX) tally_bump(&DrawTally::bg_tex, st_bg_tex);
+                else if (h.op == NOP_BIND_SAMP) tally_bump(&DrawTally::bg_samp, st_bg_samp);
+                else tally_bump(&DrawTally::bg_img, st_bg_img);
                 s.tex_gen[b.stage] = s.bind_gen;
             }
             for (int k = 0; k < n; k++) to[b.first + k] = b.h[k];
@@ -1275,7 +1279,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             }
             end_pass(cmd);
             full_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");
-            st_barriers++;
+            tally_bump(&DrawTally::barriers, st_barriers);
             break;
         // ---- work ----
         case NOP_CLEAR_COLOR:
@@ -1493,6 +1497,7 @@ void record_segment(VkCommandBuffer& cmd, const Segment& g) {
     replay(cmd, s, g.p, g.end);
     end_pass(cmd);
     full_barrier(cmd);
+    tally_fold();   // (this thread's counts are the totals' from here: a segment's end, not a draw)
     rmode = Mode::Serial;
     ub_limit = SIZE_MAX;
 }
@@ -1726,6 +1731,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     seg_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_seg0).count();
     segs_n += (double)seg.size();
     static double wait_ms, locks_n;
+    tally_fold();   // (the waits this thread counted while it submitted: the workers' went in at their segments' ends)
     wait_ms += (par_lock_wait_ns.load() - wait0) / 1e6, locks_n += (double)(par_locks.load() - locks0);
     if (++timed % 240 == 0) {
         logf("vk: parallel replay, a command buffer: dry pass %.2f ms, segments %.2f ms (%.1f of them), lock taken %.0f "
@@ -3100,6 +3106,7 @@ void log_slow_frame() {
 uint64_t made_ring[32];
 int64_t made_ring_present = 0;
 void log_frame_stats() {
+    tally_fold();   // (this thread's counts before the frame's log reads the totals)
     log_slow_frame();
     made_ring[presents % 32] = texture_made();
     made_ring_present = presents;
@@ -5121,7 +5128,7 @@ void fill_replay_table(MkwVkRenderer& t) {
 }
 
 std::atomic<bool> par_active{false};
-std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
+// (par_locks and par_lock_wait_ns: draw_tally.h, shared: ParLock is taken outside the replay threads too)
 std::recursive_mutex& par_mutex() {
     return par_mu;
 }

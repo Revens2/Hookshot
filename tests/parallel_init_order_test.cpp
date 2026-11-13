@@ -192,6 +192,9 @@ struct Texture {
 };
 std::vector<std::unique_ptr<Texture>> textures;
 std::mutex par_lock;   // (texture_get's ParLock: an image is made once, by whichever worker gets there first)
+// (the draw tally, gpu/vk/draw_tally.h: the parallel window folds its thread's counts before reading the totals; the
+// fixture's counters are plain and the order is what it checks, so a fold is a no-op)
+void tally_fold() {}
 Texture* create(VkImage image) {
     struct { VkImage image; VkFormat format; VkImageAspectFlags aspect; } x{image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT};
     const bool depth = false;
