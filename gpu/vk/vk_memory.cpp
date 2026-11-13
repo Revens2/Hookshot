@@ -1373,9 +1373,11 @@ struct SnapEntry {
     VmaAllocation alloc = nullptr;
     VkDeviceAddress address = 0;
     uint64_t bytes = 0, value = 0, last_use = 0, used = 0;
+    uint64_t seq = 0;   // (a submission's parts share a value: this orders the entries that hold one)
     std::vector<SnapRange> ranges;
 };
 SnapEntry snap_entries[kSnapEntries];
+uint64_t snap_seq = 0;   // (bumped when an entry is taken: the newest fill of a page is the one to keep)
 /// (hookshot, #2655) A free snapshot for a write-back recording (pools_mu held, as the shadows are): reused once the
 /// submission that took it, and every submission that read it, are done
 SnapEntry* snap_get(uint64_t value) {
@@ -1396,6 +1398,7 @@ SnapEntry* snap_get(uint64_t value) {
             e.bytes = kSnapEntryBytes;
         }
         e.value = value, e.last_use = 0, e.used = 0;
+        e.seq = ++snap_seq;
         e.ranges.clear();
         return &e;
     }
@@ -1413,23 +1416,35 @@ void snap_record(VkCommandBuffer cmd, const Pool& p, const std::vector<VkBufferC
     }
     if (!copies.empty()) vkCmdCopyBuffer(cmd, p.shadow, e.buf, (uint32_t)copies.size(), copies.data());
 }
+/// (hookshot, #2655) A snapshot range holds the page [at, at + 4 KB) of the pool at lo
+bool snap_range_holds(const SnapRange& r, uint64_t lo, uint64_t at) {
+    return r.lo == lo && at >= r.at && at + ((uint64_t)1 << kPageShift) <= r.at + r.len;
+}
+/// (hookshot, #2655) The newest of two snapshots of one page: a submission's parts share a value and keep an entry each, so
+/// a page filled again in a later part resolves to that part's fill (the one before the last diff), not the first's.
+/// tests/test_capture_late_merge.py
+bool snap_seq_newer(uint64_t seq, uint64_t best) { return seq > best; }
 /// (hookshot, #2655) The pre-diff shadow of a late page's write-back, and the use that keeps the entry until the reading
 /// submission is done (pools_mu held); false when the page was not one of that write-back's fill pages (no snapshot: the
-/// page was known then, and its post-diff shadow is no reference for the capture: the CPU wait). The buffer and offset,
-/// not an address: every merge copies the page into its own scratch (the word path writes its shadow)
+/// page was known then, and its post-diff shadow is no reference for the capture: the CPU wait). A page filled by several
+/// parts of the submission takes the newest fill; the buffer and offset, not an address: every merge copies the page into
+/// its own scratch (the word path writes its shadow)
 bool snap_lookup(uint64_t value, uint64_t lo, uint64_t at, uint64_t use, VkBuffer& buf, uint64_t& off) {
     if (!value) return false;
+    SnapEntry* hit = nullptr;
+    uint64_t hit_off = 0, best = 0;
     for (SnapEntry& e : snap_entries) {
         if (!e.buf || e.value != value) continue;
         for (const SnapRange& r : e.ranges) {
-            if (r.lo != lo || at < r.at || at + ((uint64_t)1 << kPageShift) > r.at + r.len) continue;
-            e.last_use = std::max(e.last_use, use);
-            buf = e.buf, off = r.off + (at - r.at);
-            return true;
+            if (!snap_range_holds(r, lo, at)) continue;
+            if (hit && !snap_seq_newer(e.seq, best)) continue;
+            hit = &e, hit_off = r.off + (at - r.at), best = e.seq;
         }
-        return false;
     }
-    return false;
+    if (!hit) return false;
+    hit->last_use = std::max(hit->last_use, use);
+    buf = hit->buf, off = hit_off;
+    return true;
 }
 /// (hookshot, #2655) A merge's own copy of its snapshots: wb_diff.comp's word path writes its shadow (s) as well as its
 /// guest, so two captures of the same write-back sharing one snapshot would let the first merge patch it and the second,
@@ -1476,10 +1491,16 @@ MergeScratch* merge_scratch_get(uint64_t need, uint64_t value) {
 /// (hookshot, #2655) The kept late pages merged in the recording's upload command buffer (the write-back's diff, word mode,
 /// with the pre-diff shadow as its shadow); false when the pass cannot be recorded and the caller keeps the CPU wait
 bool late_merge_record(VkCommandBuffer cmd, const std::vector<LateCopy>& copies, VkBuffer dst, uint64_t value);
+/// (hookshot, #2655) A take may plan only once the last plan was flushed: the flush is at the next recording's start
+/// (memory_begin_submission), and a burst begins none (its recording goes on, run_submit), so planning over a pending plan
+/// would clear its copies and its capture would be neither merged nor read as a late page. tests/test_capture_late_copy.py
+bool late_plan_ready(bool pending) { return !pending; }
 /// (hookshot, #2655) The runs of c's late pages, resolved under pools_mu; false when one has no GPU source, or is in the
 /// texture shadow's ranges (its copy is read at this take, before the GPU's would land), and the caller waits on the CPU
 bool late_copy_plan(Capture& c, uint64_t value) {
     if (!gpu_late_on() || !c.buffer || !c.map || c.late.empty() || c.copied.empty()) return false;
+    if (!late_plan_ready(late_plan_any.load(std::memory_order_relaxed)))
+        return false;   // (the last plan has no flush yet: the CPU wait, never a plan overwritten)
     // (the capture was made before the burst opened: a write-back noted in the burst is not in its late pages, one tagged
     // with the burst's value is in its own recording and the CPU waits; an older one's is already on the queue)
     if (late_burst_blocks(c.late_value, replay_burst_open(), replay_burst_value())) return false;

@@ -94,11 +94,14 @@ def main():
         raise SystemExit("gpu_late_on: RX_VK_CAPTURE_GPU_LATE=1 bypasses the parallel replay's guard")
     if "kLatePagesMax" not in plan or "late_pages_n" not in plan:
         raise SystemExit("late_copy_plan: no cap on the pending late pages")
+    if "late_plan_ready(" not in plan or plan.find("late_plan_ready(") > plan.find("late_plan.copies.clear()"):
+        raise SystemExit("late_copy_plan: a second take overwrites a plan its burst did not flush (the first capture is lost)")
     runs_fn = block(source, "bool late_copy_runs(")
     late_run = block(source, "struct LateRun {") + ";"
     burst_rule = block(source, "bool late_burst_blocks(")
     shadow_rule = block(source, "bool late_shadow_eligible(")
     valid_rule = block(source, "bool late_copy_still_valid(")
+    plan_rule = block(source, "bool late_plan_ready(")
     fixture = (
         r'''
 #include <algorithm>
@@ -119,7 +122,27 @@ constexpr uint64_t kPageShift = 12;   // (vk_memory.cpp's: 4 KB pages)
         + shadow_rule
         + "\n"
         + valid_rule
+        + "\n"
+        + plan_rule
         + r'''
+// (a plan, and the flush that records its pages; the plan's dst is one capture's)
+struct Plan {
+    bool any = false;
+    int capture = 0;
+    std::vector<int> pages;
+};
+// (a take: with a plan still pending the CPU waits and the pending plan stays as it was)
+bool take_plan(Plan& p, int capture, const std::vector<int>& pages) {
+    if (!late_plan_ready(p.any)) return false;
+    p.any = true, p.capture = capture, p.pages = pages;
+    return true;
+}
+// (the flush: the pages it keeps, with the capture that took them)
+void flush_plan(Plan& p, std::vector<std::pair<int, int>>& merged) {
+    if (!p.any || p.pages.empty()) return;
+    for (int page : p.pages) merged.push_back({page, p.capture});
+    p.any = false, p.pages.clear();
+}
 int main() {
     const std::vector<uint32_t> pages = {0x100, 0x101, 0x102, 0x300, 0x500, 0x103};
     const std::vector<std::pair<uint64_t, uint64_t>> pools = {{0x100ull << 12, 0x103ull << 12},
@@ -157,8 +180,37 @@ int main() {
     CHECK(!late_copy_still_valid(false, true, 7, 7));
     CHECK(!late_copy_still_valid(true, false, 7, 7));
     CHECK(!late_copy_still_valid(true, true, 7, 8));
+    // (a take plans; a burst begins no recording, so its plan is still pending when the next take comes: that take waits on
+    // the CPU and does not clear it; the flush merges the first capture's pages, which are then read as late pages)
+    Plan plan;
+    std::vector<std::pair<int, int>> merged;
+    CHECK(take_plan(plan, 1, {7}));
+    CHECK(plan.any && plan.capture == 1 && plan.pages.size() == 1);
+    CHECK(!take_plan(plan, 2, {8}));   // (the second take, in the burst: no plan, the CPU wait)
+    CHECK(plan.any && plan.capture == 1);   // (the first plan is untouched: its capture is neither lost nor unrecorded)
+    flush_plan(plan, merged);
+    CHECK(merged.size() == 1 && merged[0].first == 7 && merged[0].second == 1);
+    CHECK(!plan.any && plan.pages.empty());
+    // (the next recording begins: a take plans again)
+    CHECK(take_plan(plan, 3, {9}));
+    flush_plan(plan, merged);
+    CHECK(merged.size() == 2 && merged[1].first == 9 && merged[1].second == 3);
+    // (the negative control: planning over the pending plan clears its copy; that capture's page is never merged nor read as)
+    Plan old;
+    old.any = true, old.capture = 1, old.pages = {7};
+    merged.clear();
+    old.capture = 2, old.pages = {8};   // (what the second take overwriting the first would leave)
+    flush_plan(old, merged);
+    CHECK(merged.size() == 1 && merged[0].second == 2);
+    // (nothing planned: nothing flushed)
+    Plan none;
+    merged.clear();
+    flush_plan(none, merged);
+    CHECK(merged.empty());
+    CHECK(late_plan_ready(false));
+    CHECK(!late_plan_ready(true));
     std::puts("PASS: the late pages' runs in capture order, each pool's offsets and the fallback; the burst, shadow and "
-              "flush rules");
+              "flush rules; a plan its burst did not flush is not overwritten by the next take");
 }
 '''
     )

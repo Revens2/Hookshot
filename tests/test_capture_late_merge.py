@@ -82,6 +82,11 @@ def main():
     snap_get_block = block(source, "SnapEntry* snap_get(")
     if "VK_BUFFER_USAGE_TRANSFER_SRC_BIT" not in snap_get_block:
         raise SystemExit("snap_get: the snapshot cannot be a copy source (each merge copies it into its own scratch)")
+    lookup = block(source, "bool snap_lookup(")
+    if "snap_range_holds(" not in lookup or "snap_seq_newer(" not in lookup:
+        raise SystemExit("snap_lookup: a page filled again by a later part of the submission keeps the first part's snapshot")
+    range_rule = block(source, "bool snap_range_holds(")
+    seq_rule = block(source, "bool snap_seq_newer(")
     if "VK_BUFFER_USAGE_TRANSFER_SRC_BIT" not in shadow:
         raise SystemExit("shadow_make: the shadow cannot be a copy source (the snapshot reads it)")
     usage = source[source.index("constexpr VkBufferUsageFlags kCapBufferUsage"):]
@@ -92,12 +97,45 @@ def main():
     if "const uint v = m.w[i];" not in shader or "if (v != s.w[i])" not in shader or "g.w[i] = v;" not in shader:
         raise SystemExit("wb_diff.comp: its word path is not the merge (the post-diff word over the guest where it differs)")
 
-    fixture = r'''
+    fixture = (
+        r'''
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#include <utility>
+constexpr uint64_t kPageShift = 12;   // (vk_memory.cpp's: 4 KB pages)
+struct SnapRange { uint64_t lo, at, len, off; };
 #define CHECK(ok) do { if (!(ok)) { std::fprintf(stderr, "failed line %d\n", __LINE__); std::exit(1); } } while (0)
+'''
+        + range_rule
+        + "\n"
+        + seq_rule
+        + r'''
+// (a submission's parts each keep their own snapshot entry under one value: the page resolves to its newest fill)
+struct SnapTest {
+    uint64_t seq = 0;
+    std::vector<SnapRange> ranges;
+};
+uint64_t snap_pick(const std::vector<SnapTest>& entries, uint64_t lo, uint64_t at) {
+    const SnapTest* hit = nullptr;
+    uint64_t off = 0, best = 0;
+    for (const SnapTest& e : entries)
+        for (const SnapRange& r : e.ranges) {
+            if (!snap_range_holds(r, lo, at)) continue;
+            if (hit && !snap_seq_newer(e.seq, best)) continue;
+            hit = &e, off = r.off, best = e.seq;
+        }
+    return hit ? off : UINT64_MAX;
+}
+// (what snap_lookup did before: the first entry holding the page, whichever part of the submission filled it)
+uint64_t snap_pick_first(const std::vector<SnapTest>& entries, uint64_t lo, uint64_t at) {
+    for (const SnapTest& e : entries)
+        for (const SnapRange& r : e.ranges)
+            if (snap_range_holds(r, lo, at)) return r.off;
+    return UINT64_MAX;
+}
 // (the write-back's diff, wb_diff.comp's word path: the shadow, after, has the mirror's words where they differed, and
 // guest memory is written back the same)
 void wb_diff_words(const uint32_t* mirror, uint32_t* shadow, uint32_t* guest, size_t words) {
@@ -169,10 +207,27 @@ int main() {
     merge_words(slot_y, mirror, shared_direct, 4);
     CHECK(slot_x[0] == 99);
     CHECK(slot_y[0] == 10);   // (stale: v == s now, the second merge writes nothing)
+    // (a page the write-back filled in two parts of the same submission: the snapshot of the last fill is the one before the
+    // last diff, so the capture must be merged against it, not against the first part's)
+    std::vector<SnapTest> parts(2);
+    parts[0].seq = 1, parts[0].ranges.push_back({0x100ull << 12, 0x120ull << 12, 4096, 0});
+    parts[1].seq = 2, parts[1].ranges.push_back({0x100ull << 12, 0x120ull << 12, 4096, 65536});
+    CHECK(snap_pick(parts, 0x100ull << 12, 0x120ull << 12) == 65536);   // (the newest fill's snapshot)
+    // (the negative control: the first entry holding the page wins, the later part's fill is lost)
+    CHECK(snap_pick_first(parts, 0x100ull << 12, 0x120ull << 12) == 0);
+    // (an entry of another pool, a page neither holds, and a 4 KB read past a range's end: no snapshot)
+    std::vector<SnapTest> other(1);
+    other[0].seq = 3, other[0].ranges.push_back({0x200ull << 12, 0x120ull << 12, 4096, 4096});
+    CHECK(snap_pick(other, 0x100ull << 12, 0x120ull << 12) == UINT64_MAX);
+    std::vector<SnapTest> short_range(1);
+    short_range[0].seq = 4, short_range[0].ranges.push_back({0x100ull << 12, 0x120ull << 12, 2048, 8192});
+    CHECK(snap_pick(short_range, 0x100ull << 12, 0x120ull << 12) == UINT64_MAX);
     std::puts("PASS: the late merge with the pre-diff snapshot: the capture's bytes at the diff's unchanged words, the GPU's "
-              "where it wrote; the no-fill page waits on the CPU; two captures of one write-back both keep the diff's words");
+              "where it wrote; the no-fill page waits on the CPU; two captures of one write-back both keep the diff's words; "
+              "a page filled by several parts takes its newest snapshot");
 }
 '''
+    )
     with tempfile.TemporaryDirectory(prefix="capture-late-merge-") as tmp:
         cpp = Path(tmp) / "fixture.cpp"
         exe = Path(tmp) / "fixture.exe"
