@@ -1207,6 +1207,7 @@ def main():
     host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()   # (the renderer ABI used by host/rx_backend.c)
     host_deps += open(os.path.join(GPU, "vk", "dlss_math.h"), "rb").read()   # (host/rx_backend.c's DLSS jitter)
     host_deps += open(os.path.join(GPU, "vk", "compat", "hookshot_env.h"), "rb").read()   # (env_on: the switches' one rule)
+    host_deps += open(os.path.join(GPU, "vk", "collect_skip.h"), "rb").read()   # (host_collect_except: the collection's ranges)
     host_deps += ffmpeg_version_key()
     dav1d = dav1d_windows() if host_srcs else None
     dav1d_fl = ["-DHOOKSHOT_DAV1D", "-I" + os.path.join(dav1d, "include")] if dav1d else []

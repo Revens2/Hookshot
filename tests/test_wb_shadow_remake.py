@@ -131,6 +131,7 @@ bool create_device_buffer(uint64_t, VkBufferUsageFlags, VkBuffer& buffer, VmaAll
 }
 uint64_t vkGetBufferDeviceAddress(VkDevice, const VkBufferDeviceAddressInfo* info) { return info->buffer; }
 void logf(const char*, ...) {}
+void shadow_ranges_publish() {}   // (the collection's skip list: not what this test is about)
 namespace mkwvk {   // (the functions as vk_memory.cpp has them: there they are in mkwvk, which finds vram_pressure)
 ''' + helper + r'''
 }   // namespace mkwvk

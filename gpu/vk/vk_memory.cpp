@@ -29,6 +29,7 @@
 #include "vk_internal.h"
 #include "vk_texture.h"   // (upload_command_buffer)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
+#include "collect_skip.h"   // (the collection's ranges less the captures')
 #include "import_hold.h"
 #include "import_fence.h"
 #include "mirror_trim.h"
@@ -714,16 +715,33 @@ void stamp_page(uint64_t p, uint32_t g) {
 
 namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
 const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged();
+const std::vector<std::pair<uint64_t, uint64_t>>& collect_skip_ranges(const std::vector<std::pair<uint64_t, uint64_t>>& owned);
+bool collect_skip_captured();   // (RX_VK_COLLECT_SKIP_CAPTURED, with collect_skip_ranges below)
+thread_local uint64_t collect_skip_bytes = 0, collect_shadow_bytes = 0;   // (the skip list's totals at its last build)
 void shadow_written(const uint32_t* pages, int64_t n);   // (the write-back's diff, below: pages the captures took)
 void shadow_written_collected(const uint32_t* pages, int64_t n);   // (the write-back's diff, below: pages the collection found)
 void memory_collect_written() {
     uint32_t* pages = nullptr;
-    const int64_t n = host->collect_written(&pages);
+    const bool skip_on = collect_skip_captured() && host->collect_written_except;
+    // (once, and used for both the skip list and the put-back test: a skip list newer or older than it would leave, or walk
+    // again, ranges the other list does not have)
+    const auto& owned = capture_ranges_merged();
+    int64_t n;
+    uint64_t walked = 0;
+    if (skip_on) {
+        // (the captured ranges are left to the captures: their marks stay set and the next capture takes them anyway; the
+        // walk's find of them was the capture's own walk done a second time. The shadowed pools' pages still go through:
+        // their shadows hear of a write only from this report)
+        const auto& skip = collect_skip_ranges(owned);
+        n = host->collect_written_except(reinterpret_cast<const uint64_t(*)[2]>(skip.data()), (int)skip.size(), &pages, &walked);
+    } else {
+        n = host->collect_written(&pages);
+    }
+    int64_t put_back = 0;
     if (n > 0) {
         const uint32_t g = ++gen_now;
         // (the captured ranges once a call: a lock, a pool-list refresh and three searches for every dirty page cost the
         // replay thousands of lock cycles a submit, the cost that retired gpu_pages' lock below)
-        const auto& owned = capture_ranges_merged();
         const auto in_capture = [&owned](uint64_t guest) {
             auto it = std::upper_bound(owned.begin(), owned.end(), std::make_pair(guest, ~uint64_t(0)));
             return it != owned.begin() && guest < std::prev(it)->second;
@@ -733,18 +751,34 @@ void memory_collect_written() {
             if (!owned.empty() && in_capture(guest)) {   // (written after its submit's capture: the next capture takes it, as it is then)
                 uint64_t avail = 0;
                 if (const uint8_t* q = host->gpu_ptr(guest, &avail)) host->mark_written(q, 4096);
+                put_back++;
                 continue;
             }
             stamp_page(pages[i], g);
         }
         pages_collected += (uint64_t)n;
         cap_view_bump();
-        // (hookshot) every page the CPU wrote, captured later or not: unknown to the write-back diff's shadows before this
-        // recording's write-back. With RX_VK_CAPTURE=0 this is the only report of the game's writes (capture_make returns
-        // first); with captures, it is the pages written after this submission's capture (PR 1109's review)
+        // (hookshot) every page the walk found: unknown to the write-back diff's shadows before this recording's write-back.
+        // With RX_VK_CAPTURE=0 this is the only report of the game's writes (capture_make returns first); with captures, it
+        // is the pages written after this submission's capture (PR 1109's review), and the captured ranges left out above
+        // are the pools no shadow reads a report of (collect_skip_ranges)
         shadow_written_collected(pages, n);
     }
     if (pages) host->free_pages(pages);
+    static int64_t st_calls, st_found, st_back;
+    static uint64_t st_walked, st_left, st_shadow;
+    st_calls++, st_found += n > 0 ? n : 0, st_back += put_back, st_walked += walked;
+    if (skip_on) st_left += collect_skip_bytes, st_shadow += collect_shadow_bytes;
+    if (st_calls % 600 == 0) {
+        if (skip_on)
+            logf("vk: collection (600 submits): %.2f MB walked a submit (%.2f MB of captured ranges left to the captures, "
+                 "%.2f MB walked for the shadows), %.1f pages found, %.1f put back", st_walked / 600.0 / 1048576.0,
+                 st_left / 600.0 / 1048576.0, st_shadow / 600.0 / 1048576.0, st_found / 600.0, st_back / 600.0);
+        else   // (RX_VK_COLLECT_SKIP_CAPTURED=0: the host's whole walk, whose bytes it does not count)
+            logf("vk: collection (600 submits): %.1f pages found, %.1f put back (RX_VK_COLLECT_SKIP_CAPTURED=0: the whole walk)",
+                 st_found / 600.0, st_back / 600.0);
+        st_calls = st_found = st_back = 0, st_walked = st_left = st_shadow = 0;
+    }
 }
 uint32_t memory_generation() {
     return gen_now;
@@ -1123,6 +1157,7 @@ bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& m
 std::vector<std::pair<uint64_t, uint64_t>> cap_ranges;   // (the mirrored pools the captures take, as of the last one)
 std::mutex cap_ranges_mu;
 uint64_t cap_ranges_ver = 1;   // (any of the captures' range lists changed: cap_ranges_mu)
+thread_local uint64_t capture_ranges_seen = 0;   // (the version this thread's capture_ranges_merged answered for)
 // (and the game's pools up to RX_VK_CAPTURE_POOL_MB (default 64; 0: none) from when they are made, mirrored or not:
 // pools are imported, and mirrored, at the replay's first binding of them, two presents behind the game, and the
 // captures taken before that left them out. MK World moves its per-frame data to a new pool every so many frames:
@@ -1912,7 +1947,10 @@ const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged() {
     static thread_local uint64_t ver = ~uint64_t(0);
     // (no capture is ever made without the replay thread (RX_VK_ASYNC=0): the mirrored pools' writes were left for one
     // that never came, and the pools kept their first contents: a grey world)
-    if (!capture_on() || !captures_seen.load(std::memory_order_relaxed)) return none;
+    if (!capture_on() || !captures_seen.load(std::memory_order_relaxed)) {
+        capture_ranges_seen = 0;
+        return none;
+    }
     std::lock_guard lk(cap_ranges_mu);
     refresh_pool_ranges_locked();   // (a pool made since the last capture: the next one takes its pages, not this)
     if (ver != cap_ranges_ver) {
@@ -1929,6 +1967,7 @@ const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged() {
                 merged.push_back(r);
         }
     }
+    capture_ranges_seen = cap_ranges_ver;   // (the version `merged` is: collect_skip_ranges' key)
     return merged;
 }
 // (hookshot) see vk_internal.h. Raised where a recording gets a read of guest memory itself, at the GPU's time: a pool
@@ -2668,6 +2707,68 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
     static int logged;
     if (logged++ < 8 || retired_pools.size() % 64 == 0)
         logf("vk: pool %#llx remade larger (%zu retired)", (unsigned long long)old->lo, retired_pools.size());
+}
+
+// ---- (hookshot, P1) the ranges the replay's collection leaves to the captures ----
+// memory_collect_written walks every GPU-visible range and takes each marked page, then puts the captured pages back
+// (mark_written) for the next capture: for those pages its find is the capture's own walk done a second time, and its
+// report only feeds the write-back diff's shadows, which pools without one ignore (shadows_forget_written). The walk
+// leaves the captured ranges to the captures (their marks stay set; the next capture takes them anyway), less the
+// shadowed pools' pages: the skip list below. RX_VK_COLLECT_SKIP_CAPTURED=0: the whole walk, as before.
+bool collect_skip_captured() {
+    static const bool v = [] {
+        const char* e = getenv("RX_VK_COLLECT_SKIP_CAPTURED");
+        return !e || !env_value_off(e);
+    }();
+    return v;
+}
+std::mutex shadow_ranges_mu;   // (leaf: taken with pools_mu held, never while taking another lock)
+std::vector<std::pair<uint64_t, uint64_t>> shadow_ranges;   // (the shadowed pools' pages: they stay in the collection's walk)
+uint64_t shadow_ranges_ver = 1;                             // (shadow_ranges_mu: the list changed)
+// (pools_mu held) the shadowed pools' ranges, merged: the collection's skip list changed, a few times a session (a shadow
+// made, given back, or a pool retired)
+void shadow_ranges_publish() {
+    std::vector<std::pair<uint64_t, uint64_t>> v;
+    for (const auto& [lo, p] : imported)
+        if (p.shadow) v.push_back({p.lo, p.hi});
+    for (const auto& nh : retired_pools)
+        if (nh.mapped().shadow) v.push_back({nh.mapped().lo, nh.mapped().hi});
+    std::sort(v.begin(), v.end());
+    std::vector<std::pair<uint64_t, uint64_t>> merged;
+    for (const auto& r : v) {
+        if (!merged.empty() && r.first <= merged.back().second) merged.back().second = std::max(merged.back().second, r.second);
+        else merged.push_back(r);
+    }
+    std::lock_guard lk(shadow_ranges_mu);
+    shadow_ranges.swap(merged);
+    shadow_ranges_ver++;
+}
+// (P1, and memory_collect_written's) the captured ranges less the shadowed pools', as `owned` is the calling thread's
+// capture_ranges_merged() just before: a skip list is never wider than the capture list it was cut from, or pages would
+// be left marked with no capture to take them. Keyed on both lists' versions, as capture_ranges_merged is. The reference
+// is the calling thread's until its next call. wb_diff_on() off: no pool has a shadow, so nothing is kept walked.
+const std::vector<std::pair<uint64_t, uint64_t>>& collect_skip_ranges(const std::vector<std::pair<uint64_t, uint64_t>>& owned) {
+    static const std::vector<std::pair<uint64_t, uint64_t>> none;
+    static thread_local std::vector<std::pair<uint64_t, uint64_t>> skip;
+    static thread_local uint64_t cap_ver = 0, sh_ver = 0;
+    if (owned.empty()) {
+        collect_skip_bytes = collect_shadow_bytes = 0;
+        return none;
+    }
+    std::lock_guard lk(shadow_ranges_mu);
+    if (cap_ver == capture_ranges_seen && sh_ver == shadow_ranges_ver) return skip;
+    cap_ver = capture_ranges_seen, sh_ver = shadow_ranges_ver;
+    collect_skip_bytes = collect_shadow_bytes = 0;
+    // (wb_diff_on() off: no pool has a shadow, shadow_ranges is empty, and the subtraction keeps every captured page)
+    skip.resize(owned.size() + 2 * shadow_ranges.size() + 8);   /* (at most two ranges a skip range: collect_skip.h) */
+    const int64_t n = ranges_minus(reinterpret_cast<const uint64_t(*)[2]>(owned.data()), (int)owned.size(),
+                                   reinterpret_cast<const uint64_t(*)[2]>(shadow_ranges.data()), (int)shadow_ranges.size(),
+                                   reinterpret_cast<uint64_t(*)[2]>(skip.data()), (int)skip.size());
+    skip.resize(n < 0 ? 0 : (size_t)n);   // (-1: never with that size; the whole walk rather than none)
+    for (const auto& r : skip) collect_skip_bytes += r.second - r.first;
+    for (const auto& r : owned) collect_shadow_bytes += r.second - r.first;
+    collect_shadow_bytes -= collect_skip_bytes;
+    return skip;
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
@@ -3944,12 +4045,16 @@ void shadow_free(Pool& p) {   // (pools_mu held: destroyed once the submissions 
     shadow_bytes -= p.hi - p.lo;
     p.shadow = VK_NULL_HANDLE, p.shadow_alloc = nullptr, p.shadow_address = 0;
     p.shadow_known.clear();
+    shadow_ranges_publish();   // (its pages go back into the collection's walk)
 }
 void shadows_reap() {
+    bool reaped = false;
     while (!dead_shadows.empty() && dead_shadows.front().value <= mem_completed) {
         destroy_buffer(dead_shadows.front().buffer, dead_shadows.front().alloc);
         dead_shadows.pop_front();
+        reaped = true;
     }
+    if (reaped) shadow_ranges_publish();   // (a dead shadow's buffer is gone: the skip list rebuilt from the pools that have one)
 }
 // (hookshot) The shadows' two rules read what is really allocated (the driver's count less the free space inside VMA's blocks,
 // as the texture budget's 90% rule does: vram_pressure.h), not the count alone. By the count alone they went at 95% and
@@ -3991,6 +4096,7 @@ bool shadow_make(Pool& p) {
     p.shadow_address = vkGetBufferDeviceAddress(dev.device, &da);
     p.shadow_known.assign((size_t)((n >> kPageShift) + 63) / 64, 0);
     shadow_bytes += n;
+    shadow_ranges_publish();   // (its pages leave the collection's skip list: the shadow hears of them from the report)
     static int logged;
     if (logged++ < 16)
         logf("vk: write-back diff: a shadow for pool %#llx (%llu MB; %llu MB of shadows)", (unsigned long long)p.lo,

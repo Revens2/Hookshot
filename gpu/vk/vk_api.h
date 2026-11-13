@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 22
+#define MKWVK_API_VERSION 23
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA, HOS_OPT_CHEAT_SPEED };
 /* (hookshot) the Gameplay tab's Text size (host/oot_text_size.c): 0 the game's, 1 110%, 2 125%, 3 150%, 4 175% */
 enum { HOS_OPT_TEXT_SIZE = 10 };
@@ -201,6 +201,10 @@ typedef struct MkwVkHost {
        while the game draws it in the middle 16:9 with the menus (wide_menus's keep_mask) and so leaves the sides open
        (host/hos_main.c hos_wide_cover); 0 when it covers the whole picture itself. Asked at each present */
     float (*wide_cover)(void);
+    /* (version 23, hookshot) the soft write watch's marks over the GPU-visible ranges less skip (sorted, disjoint): the
+       ranges the captures own are left marked, their next capture takes them anyway (gpu/vk/vk_memory.cpp
+       memory_collect_written, RX_VK_COLLECT_SKIP_CAPTURED); walked gets the bytes of the ranges walked */
+    int64_t (*collect_written_except)(const uint64_t (*skip)[2], int nskip, uint32_t **pages, uint64_t *walked);
 } MkwVkHost;
 
 /* One completed temporal-upscale sample; all zero while inactive. */

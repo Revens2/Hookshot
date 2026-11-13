@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "../gpu/vk/vk_api.h"
+#include "../gpu/vk/collect_skip.h"
 #include "../gpu/vk/dlss_math.h"
 #include "control.h"
 
@@ -159,6 +160,27 @@ static int64_t host_collect(uint32_t **pages) {
 /* (only within the given guest ranges: the submit-time capture of the mirrored pools, a small part of the 20 ms the
    whole collection takes) */
 static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { return collect_in(ranges, n, pages); }
+/* (the captured ranges the renderer holds are left marked in the watch: it walks the GPU-visible ranges less skip, and
+   the bit clearing they got here, then being taken again, was the captures' work done twice a submit) */
+static int64_t host_collect_except(const uint64_t (*skip)[2], int nskip, uint32_t **pages, uint64_t *walked) {
+    static _Thread_local uint64_t (*all)[2];
+    static _Thread_local uint64_t (*keep)[2];
+    static _Thread_local int keep_cap;
+    enum { kMaxGpu = 4096 };
+    if (!all) all = malloc(sizeof *all * kMaxGpu);
+    const int n = hos_gpu_guest_ranges(all, kMaxGpu);
+    const int need = 2 * n + nskip + 8;   /* (at most two ranges a skip range: gpu/vk/collect_skip.h) */
+    if (keep_cap < need) {
+        keep_cap = need;
+        keep = realloc(keep, (size_t)keep_cap * sizeof *keep);
+    }
+    const int nk = ranges_minus((const uint64_t(*)[2])all, n, skip, nskip, keep, keep_cap);
+    const int use = nk < 0 ? n : nk;   /* (-1: never with that size; the whole walk rather than none) */
+    uint64_t bytes = 0;
+    for (int i = 0; i < use; i++) bytes += keep[i][1] - keep[i][0];
+    if (walked) *walked = bytes;
+    return collect_in((const uint64_t(*)[2])keep, use, pages);
+}
 #else
 static int64_t host_collect(uint32_t **pages) {
     int64_t n = -1;
@@ -166,6 +188,11 @@ static int64_t host_collect(uint32_t **pages) {
     return n;
 }
 static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { (void)ranges, (void)n; *pages = 0; return 0; }
+static int64_t host_collect_except(const uint64_t (*skip)[2], int nskip, uint32_t **pages, uint64_t *walked) {
+    (void)skip, (void)nskip;
+    if (walked) *walked = 0;
+    return host_collect(pages);
+}
 #endif
 static void host_free_pages(uint32_t *pages) { free(pages); }
 static void host_mark_written(const void *p, uint64_t n) {
@@ -248,7 +275,7 @@ static const MkwVkHost vk_host = {
     host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, host_take_key_press,
     hos_mouse_pointer, hos_mic_count, hos_mic_name, hos_mic_select, hos_sdl_gyro_status, hos_log_flush, hos_prompts_face,
     host_romfs_dir, host_wide_menus, host_slept_ns, host_fps_timing, hos_prompts_live_parts, host_screen_size,
-    hos_wide_cover,
+    hos_wide_cover, host_collect_except,
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
