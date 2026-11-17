@@ -276,6 +276,8 @@ struct {
 std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
 std::atomic<bool> par_active{false};
 std::vector<int> run_order;   // (the order the workers run in, one after another; empty: all at once)
+bool balance = false;         // (replay_handle's RX_VK_PARALLEL_BALANCE: segment 0 recorded on the replay thread, this one)
+thread_local uint64_t ub_gen = 0;   // (the replay thread's uniform-overlay generation, bumped after its segment)
 std::vector<std::thread> workers;
 bool jobs_started;
 std::atomic<int> running{0};   // (workers still recording)
@@ -311,8 +313,13 @@ void RunJobs::notify_all() {
         }
         return;
     }
-    CHECK(jobs.size() == run_order.size());
-    for (int k : run_order) std::thread(jobs[k]).join();
+    // (balance (par_split.h): segment 0 is not queued, the replay thread records it after this returns; the others are
+    // jobs[k - 1])
+    std::vector<int> order;
+    for (int k : run_order)
+        if (!balance || k != 0) order.push_back(balance ? k - 1 : k);
+    CHECK(jobs.size() == order.size());
+    for (int k : order) std::thread(jobs[k]).join();
     std::lock_guard lk(par_pool.mu);
     par_pool.pending = 0;
 }
@@ -442,6 +449,19 @@ int main(int argc, char** argv) {
         bc_scratch = bc_scratch2 = VK_NULL_HANDLE, bc_have = false;
         submit_segments({{"S"}, {"S"}}, {1, 0});
         play("scratch2 (both fresh)");
+    } else if (c == "balance_later_makes") {   // (balance: segment 1's worker makes the texture, then the replay thread records
+                                               // segment 0, which uploads it again and draws with it)
+        balance = true;
+        submit_segments({{"t"}, {"t"}}, {1, 0});
+        play(c.c_str());
+    } else if (c == "balance_three") {   // (balance: 2 makes it, then 1 uses it, then the replay thread records segment 0)
+        balance = true;
+        submit_segments({{"-"}, {"t"}, {"t"}}, {2, 1, 0});
+        play(c.c_str());
+    } else if (c == "balance_at_once") {   // (balance: the workers start at once while the replay thread records segment 0)
+        balance = true;
+        submit_segments({{"t"}, {"zt"}, {"t"}}, {});
+        play(c.c_str());
     } else if (c == "in_order") {   // (made by the first segment, as serial replay would)
         submit_segments({{"t"}, {"t"}}, {0, 1});
         play(c.c_str());
