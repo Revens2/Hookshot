@@ -1264,10 +1264,50 @@ inline SubmittedPage& submitted_page_for(uint64_t page) {   // (a page and its n
     static const bool one = getenv("RX_VK_SUBMITTED_PAGES") && atoi(getenv("RX_VK_SUBMITTED_PAGES")) == 1;
     return submitted_pages[one ? 0 : (page + (page >> 5) * 13) & (kSubmittedPages - 1)];
 }
+// (hookshot) A page a capture holds, its bytes: the read of a captured page took pools_mu and the capture table's lookup
+// every time, though a page's capture (its entry's generation) and the capture table (cap_view_gen) were the same as the
+// read before. The whole 4 KB page is kept here then, and a repeat copies from it without the lock. Filled only from a
+// slot the table holds under pools_mu, tagged with the view read before the lock, and only kept if the view did not move
+// while it was copied. RX_VK_CAPTURE_PAGE_CACHE=0: the locked path every time)
+struct CapturedPage {
+    uint64_t page = ~0ull;
+    uint32_t pgen = 0;
+    uint64_t view = 0;
+    uint8_t bytes[4096];
+};
+constexpr int kCapturedPages = 4;
+thread_local CapturedPage captured_pages[kCapturedPages];
+inline CapturedPage& captured_page_for(uint64_t page) {
+    return captured_pages[(page + (page >> 5) * 13) & (kCapturedPages - 1)];
+}
+std::atomic<int64_t> st_captured_page_hits{0};
+bool captured_page_cache_on() {   // (on unless set off: the switches' one rule, hookshot_env.h)
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_CAPTURE_PAGE_CACHE");
+        return !e || !env_value_off(e);
+    }();
+    return on;
+}
 
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     // (once a capture exists, every uniform word took pools_mu to ask whether its page was in one. A page in none keeps
     // that answer until a stamp or a new capture)
+    // (a page a capture holds, read before: its bytes are this thread's copy, so the guest read and the lock are both skipped)
+    if (n && captured_page_cache_on() && capture_on() && captures_seen.load(std::memory_order_relaxed)) {
+        const uint64_t hguest = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
+        const uint64_t hpage = hguest >> kPageShift;
+        if (hguest && (hguest + n - 1) >> kPageShift == hpage) {
+            const CapturedPage& hit = captured_page_for(hpage);
+            const uint64_t hview = cap_view_gen.load(std::memory_order_acquire);
+            if (hit.page == hpage && hit.pgen == page_gen(hpage) && hit.view == hview) {
+                std::memcpy(dst, hit.bytes + (hguest & 4095), n);
+                if (cap_view_gen.load(std::memory_order_acquire) == hview) {   // (a capture retired or landed under us: the guest read below)
+                    st_captured_page_hits.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+        }
+    }
     if (!host->gpu_read(gpu, dst, n)) return false;
     if (!n || !capture_on() || !captures_seen.load(std::memory_order_relaxed)) return true;
     const uint64_t guest = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
@@ -1278,8 +1318,12 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     if (page0 == page1 && submitted_page_reuse(page0, page_gen(page0), view, submitted_page.page, submitted_page.pgen,
                                                submitted_page.view))
         return true;
+    // (a single captured page: keep it, under the lock, for the reads after this one)
+    const bool page_cache = captured_page_cache_on();
+    CapturedPage* cp = page_cache && page0 == page1 ? &captured_page_for(page0) : nullptr;
     static std::atomic<int64_t> reads{0}, pages_from{0};
     int64_t from = 0;
+    bool kept = false;
     {
         std::lock_guard lk(pools_mu);
         for (uint64_t page = guest >> kPageShift; page < (guest + n + 4095) >> kPageShift; page++) {
@@ -1290,17 +1334,24 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
             const uint64_t a = std::max(page << kPageShift, guest), z = std::min((page + 1) << kPageShift, guest + n);
             std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
             from++;
+            if (cp && page == page0) {   // (a single captured page: keep it, under the lock, for the reads after this one)
+                std::memcpy(cp->bytes, (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, 4096);
+                cp->page = page0, cp->pgen = page_gen(page0), cp->view = view;
+                kept = true;
+            }
         }
         if (page0 == page1 && from == 0) {   // (in no capture: guest memory stands for its next words too)
             submitted_page.page = page0;
             submitted_page.pgen = page_gen(page0);
             submitted_page.view = cap_view_gen.load(std::memory_order_relaxed);
+            if (cp) cp->page = ~0ull;
         }
     }
+    if (kept && cap_view_gen.load(std::memory_order_acquire) != view && cp) cp->page = ~0ull;   // (the table moved while it was copied)
     pages_from += from;
     if (++reads % 20000 == 0)
-        logf("vk: replay reads of guest memory as submitted: %lld (%lld pages from the captures)", (long long)reads.load(),
-             (long long)pages_from.load());
+        logf("vk: replay reads of guest memory as submitted: %lld (%lld pages from the captures, %lld from the page cache)",
+             (long long)reads.load(), (long long)pages_from.load(), (long long)st_captured_page_hits.load());
     return true;
 }
 
