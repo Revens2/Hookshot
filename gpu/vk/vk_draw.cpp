@@ -1046,6 +1046,7 @@ struct Targets {
     bool has_block_images = false;
     uint32_t width = 0, height = 0;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    uint8_t color_type[8]{};   // (hookshot) each colour target's output type (color_types_of): resolved with the targets, not per draw
 };
 
 /// (hookshot) The colour output types a program is translated for: each target's, by its format (Shader::AttributeType). The draw's,
@@ -4310,6 +4311,7 @@ Targets targets(NvnState& s) {
             }
         }
     }
+    color_types_of(at, at.color_type);   // (hookshot) resolved with the targets: a draw of them reads the cached types
     targets_serial = s.rt_serial;
     cached_targets = at;
     return at;
@@ -5650,6 +5652,8 @@ void stats_code_keys(FILE* f, uint32_t n) {
 }
 /// (each draw) arms a capture when the trigger file is there; writes the results once the measured frame is long done
 void stats_tick() {
+    static const bool enabled = stats_dir() != nullptr;   // (RX_VK_DRAW_STATS, read once: off, nothing a draw)
+    if (!enabled) return;
     const char* dir = stats_dir();
     if (!dir) return;
     const int64_t frame = (int64_t)texture_frame_no();
@@ -6801,8 +6805,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         temporal_note_scene_draw(at.color[0], at.width, at.height, at.depth, s.ubo[0][0].addr, s.ubo[0][0].size);
         fsr3_inputs::note_scene_draw(at.color[0], at.width, at.height, at.depth, s.ubo[0][0].addr, s.ubo[0][0].size);
     }
-    uint8_t types[8];
-    color_types_of(at, types);
+    const uint8_t* types = at.color_type;   // (hookshot) resolved with the targets (targets()): no per-draw format classification
     const Program* cp;
     ProgramUse use(s.prog, s.has_prog, false);   // (the program's first draw, for the census: vk_programs.h)
     {
