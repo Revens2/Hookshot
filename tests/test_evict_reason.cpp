@@ -43,6 +43,16 @@ int main() {
     clean.add(DEAD, false, 1);
     describe(clean, line, sizeof line);
     expect(!std::strcmp(line, "budget 0, drawn over 0, dead targets 1"), "nothing lost: no second part");
+    // (hookshot) finalized uploads left behind under the budget (finalized_upload.h): a reason of their own, shown only when some went
+    expect(classify(false, false, true) == LEFT_BEHIND, "left behind under the budget");
+    expect(classify(false, true, true) == DRAWN_OVER && classify(true, false, true) == DEAD, "drawn over or dead first");
+    Tally lb;
+    lb.add(BUDGET, false, 1);
+    lb.add(LEFT_BEHIND, false, 1);
+    lb.add(LEFT_BEHIND, false, 1);
+    expect(lb.total() == 3, "left behind counted in the total");
+    describe(lb, line, sizeof line);
+    expect(!std::strcmp(line, "budget 1, drawn over 0, dead targets 0, left behind 2"), line);
     char tiny[8];
     describe(t, tiny, sizeof tiny);
     expect(std::strlen(tiny) == sizeof tiny - 1, "a short buffer: cut, still terminated");
